@@ -31,14 +31,25 @@ class MobTemplateRepository:
             """
             INSERT OR REPLACE INTO mob_templates
                 (id, name, class, level, base_health, base_mana,
-                 spawn_x, spawn_y, zone_id, respawn_sec, stats_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 spawn_x, spawn_y, zone_id, respawn_sec,
+                 aggression_type, aggro_range, attack_range,
+                 leash_range, patrol_radius, move_speed,
+                 attack_cooldown, stats_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data["id"], data["name"], data["class"],
                 data["level"], data["base_health"], data["base_mana"],
                 data["spawn_x"], data["spawn_y"],
-                data["zone_id"], data["respawn_sec"], stats,
+                data["zone_id"], data["respawn_sec"],
+                data.get("aggression_type", "passive"),
+                data.get("aggro_range", 80.0),
+                data.get("attack_range", 5.0),
+                data.get("leash_range", 200.0),
+                data.get("patrol_radius", 30.0),
+                data.get("move_speed", 40.0),
+                data.get("attack_cooldown", 2.0),
+                stats,
             ),
         )
         self._db.commit()

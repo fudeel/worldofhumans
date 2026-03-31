@@ -2,22 +2,27 @@
 """
 Terminal entry point for the game server.
 
-Bootstraps the database, loads zones and mob templates,
-wires up all systems, and runs an interactive command loop
-that simulates client inputs against the real server logic.
+Boots the database, seeds zones and mob templates, then starts
+a ``ZoneController`` per zone in background threads.  The world
+is now alive — mobs patrol, chase, and attack on their own.
+
+The terminal provides commands to connect players, move them
+into zones, and watch the zone react in real time.
 """
 
 from __future__ import annotations
 
+import time
+
 from game.characters.character import Character
 from game.core.event_bus import EventBus
-from game.core.game_loop import GameLoop
 from game.db.database import Database
 from game.db.repositories.mob_template_repo import MobTemplateRepository
 from game.db.repositories.player_repo import PlayerRepository
 from game.db.repositories.zone_repo import ZoneRepository
 from game.definitions import get_class_definition
 from game.enums.character_class_type import CharacterClassType
+from game.enums.mob_state import MobState
 from game.enums.race import Race
 from game.network.connection import Connection
 from game.network.connection_manager import ConnectionManager
@@ -25,10 +30,11 @@ from game.network.message import Message
 from game.network.message_type import MessageType
 from game.systems.combat_system import AttackIntent, CombatSystem
 from game.systems.movement_system import MoveIntent, MovementSystem
-from game.systems.spawn_system import SpawnSystem
 from game.systems.sync_system import SyncSystem
+from game.world.mob_instance import MobInstance
 from game.world.world import World
 from game.world.zone import Zone, ZoneBounds
+from game.world.zone_controller import ZoneController
 
 
 # ── database seeding ───────────────────────────────────────────────
@@ -47,22 +53,46 @@ def _seed_zones(repo: ZoneRepository) -> None:
 
 
 def _seed_mobs(repo: MobTemplateRepository) -> None:
-    """Insert starter mob templates if empty."""
+    """Insert starter mob templates with AI configuration."""
     if repo.load_by_zone("elwynn_forest"):
         return
     templates = [
-        {"id": "wolf_01", "name": "Forest Wolf", "class": "WARRIOR",
-         "level": 2, "base_health": 60, "base_mana": 0,
-         "spawn_x": 150.0, "spawn_y": 150.0,
-         "zone_id": "elwynn_forest", "respawn_sec": 30, "stats_json": {}},
-        {"id": "bandit_01", "name": "Defias Bandit", "class": "ROGUE",
-         "level": 3, "base_health": 80, "base_mana": 0,
-         "spawn_x": 250.0, "spawn_y": 300.0,
-         "zone_id": "elwynn_forest", "respawn_sec": 45, "stats_json": {}},
-        {"id": "kobold_01", "name": "Kobold Miner", "class": "WARRIOR",
-         "level": 1, "base_health": 40, "base_mana": 0,
-         "spawn_x": 350.0, "spawn_y": 200.0,
-         "zone_id": "elwynn_forest", "respawn_sec": 20, "stats_json": {}},
+        {
+            "id": "wolf_01", "name": "Forest Wolf",
+            "class": "WARRIOR", "level": 2,
+            "base_health": 60, "base_mana": 0,
+            "spawn_x": 150.0, "spawn_y": 150.0,
+            "zone_id": "elwynn_forest", "respawn_sec": 15,
+            "aggression_type": "aggressive",
+            "aggro_range": 60.0, "attack_range": 5.0,
+            "leash_range": 150.0, "patrol_radius": 25.0,
+            "move_speed": 45.0, "attack_cooldown": 1.5,
+            "stats_json": {},
+        },
+        {
+            "id": "bandit_01", "name": "Defias Bandit",
+            "class": "ROGUE", "level": 3,
+            "base_health": 80, "base_mana": 0,
+            "spawn_x": 250.0, "spawn_y": 300.0,
+            "zone_id": "elwynn_forest", "respawn_sec": 20,
+            "aggression_type": "aggressive",
+            "aggro_range": 50.0, "attack_range": 5.0,
+            "leash_range": 120.0, "patrol_radius": 20.0,
+            "move_speed": 35.0, "attack_cooldown": 2.0,
+            "stats_json": {},
+        },
+        {
+            "id": "deer_01", "name": "Young Deer",
+            "class": "WARRIOR", "level": 1,
+            "base_health": 30, "base_mana": 0,
+            "spawn_x": 350.0, "spawn_y": 200.0,
+            "zone_id": "elwynn_forest", "respawn_sec": 10,
+            "aggression_type": "passive",
+            "aggro_range": 0.0, "attack_range": 5.0,
+            "leash_range": 100.0, "patrol_radius": 40.0,
+            "move_speed": 50.0, "attack_cooldown": 3.0,
+            "stats_json": {},
+        },
     ]
     for t in templates:
         repo.save(t)
@@ -72,7 +102,7 @@ def _seed_mobs(repo: MobTemplateRepository) -> None:
 
 def _build_server() -> dict:
     """
-    Construct and wire every server component.
+    Construct every server component and start zone controllers.
 
     Returns a dict of named references for the terminal loop.
     """
@@ -90,6 +120,12 @@ def _build_server() -> dict:
     world = World()
     connections = ConnectionManager()
 
+    movement = MovementSystem(world, event_bus)
+    combat = CombatSystem(world, event_bus, base_damage=15)
+    sync = SyncSystem(world, event_bus, connections)
+
+    controllers: dict[str, ZoneController] = {}
+
     for row in zone_repo.list_all():
         zone = Zone(
             zone_id=row["id"],
@@ -100,19 +136,17 @@ def _build_server() -> dict:
         )
         world.add_zone(zone)
 
-    movement = MovementSystem(world, event_bus)
-    combat = CombatSystem(world, event_bus)
-    spawn = SpawnSystem(world, event_bus)
-    sync = SyncSystem(world, event_bus, connections)
+        controller = ZoneController(
+            zone=zone, world=world, event_bus=event_bus,
+            connections=connections, movement=movement,
+            combat=combat, sync=sync, tick_rate=20,
+        )
 
-    for t in mob_repo.load_by_zone("elwynn_forest"):
-        spawn.register_template(t)
+        for t in mob_repo.load_by_zone(zone.zone_id):
+            mob = MobInstance.from_template(t)
+            controller.register_mob(mob)
 
-    game_loop = GameLoop(tick_rate=20)
-    game_loop.register_system(movement)
-    game_loop.register_system(combat)
-    game_loop.register_system(spawn)
-    game_loop.register_system(sync)
+        controllers[zone.zone_id] = controller
 
     return {
         "db": db,
@@ -121,12 +155,12 @@ def _build_server() -> dict:
         "connections": connections,
         "movement": movement,
         "combat": combat,
-        "game_loop": game_loop,
+        "controllers": controllers,
         "event_bus": event_bus,
     }
 
 
-# ── player connection helper ───────────────────────────────────────
+# ── player helpers ─────────────────────────────────────────────────
 
 def _connect_player(srv: dict, player_id: str, name: str,
                     race: Race, class_type: CharacterClassType,
@@ -169,18 +203,37 @@ def _connect_player(srv: dict, player_id: str, name: str,
         print(f"  [{player_id}] is OUTSIDE all gaming zones")
 
 
+def _disconnect_player(srv: dict, player_id: str) -> None:
+    """Save and remove a player from the world."""
+    pos = srv["world"].get_entity_position(player_id)
+    entity = srv["world"].get_entity(player_id)
+    if entity and pos:
+        srv["player_repo"].save({
+            "id": player_id, "name": entity.name,
+            "race": "", "class": "", "level": entity.level,
+            "health": entity.health.current, "mana": 0,
+            "position_x": pos[0], "position_y": pos[1],
+            "stats_json": {},
+        })
+    srv["world"].remove_entity(player_id)
+    srv["connections"].remove(player_id)
+    print(f"  [{player_id}] disconnected and saved.")
+
+
 # ── terminal command loop ──────────────────────────────────────────
 
 def _print_help() -> None:
     print("""
 Commands:
-  connect <id> <name> <race> <class> <x> <y>  — join the server
+  connect <id> <n> <race> <class> <x> <y>  — join the world
+  disconnect <id>                              — leave and save
   move <id> <x> <y>                            — move a player
-  attack <attacker_id> <target_id>             — attack an entity
-  tick                                         — advance one server tick
-  status <id>                                  — show entity info
-  nearby <id>                                  — list nearby entities
-  zones                                        — list all zones
+  attack <id> <target>                         — attack a target
+  status <id>                                  — entity info
+  nearby <id>                                  — nearby entities
+  mobs                                         — all live mobs
+  zones                                        — zone info
+  watch [seconds]                              — watch the world live
   quit                                         — shut down
 
 Races:   Human, Dwarf, Night Elf, Gnome, Orc, Tauren, Troll, Undead
@@ -188,16 +241,50 @@ Classes: Hunter, Mage, Druid, Paladin, Priest, Rogue, Shaman, Warlock, Warrior
 """)
 
 
+def _watch_world(srv: dict, duration: float) -> None:
+    """Print a live snapshot of the world every half-second."""
+    end = time.monotonic() + duration
+    while time.monotonic() < end:
+        print(f"\n--- World snapshot (t={time.monotonic():.1f}) ---")
+        for zid, ctrl in srv["controllers"].items():
+            print(f"  Zone '{zid}': ticks={ctrl.tick_count}, mobs={ctrl.mob_count}")
+
+        for zid, ctrl in srv["controllers"].items():
+            for mid, mob in list(ctrl._mobs.items()):
+                pos = srv["world"].get_entity_position(mid)
+                state = mob.brain.state.value
+                target = mob.brain.target_id or "-"
+                hp = f"{mob.entity.health.current}/{mob.entity.health.maximum}"
+                pos_str = f"({pos[0]:.1f}, {pos[1]:.1f})" if pos else "(?)"
+                print(f"    {mob.display_name:16s} {pos_str:16s} "
+                      f"hp={hp:8s} state={state:16s} target={target}")
+
+        player_ids = srv["connections"].get_all_ids()
+        for pid in sorted(player_ids):
+            e = srv["world"].get_entity(pid)
+            p = srv["world"].get_entity_position(pid)
+            zone = srv["world"].get_entity_zone_id(pid) or "OUTSIDE"
+            if e and p:
+                hp = f"{e.health.current}/{e.health.maximum}"
+                print(f"    Player {pid:12s} ({p[0]:.1f}, {p[1]:.1f}) "
+                      f"hp={hp:8s} zone={zone}")
+        time.sleep(0.5)
+
+
 def run() -> None:
-    """Boot the server and enter the interactive command loop."""
+    """Boot the server with live zone controllers."""
     print("=" * 55)
-    print("  GAME SERVER — terminal simulation")
+    print("  GAME SERVER — live zone controllers")
     print("=" * 55)
 
     srv = _build_server()
-    print("\nServer ready. Type 'help' for commands.\n")
 
-    dt = 0.05
+    for zid, ctrl in srv["controllers"].items():
+        ctrl.start()
+        print(f"  Zone '{zid}' controller started ({ctrl.mob_count} mobs)")
+
+    print("\nWorld is LIVE. Mobs are patrolling.")
+    print("Type 'help' for commands.\n")
 
     while True:
         try:
@@ -225,19 +312,16 @@ def run() -> None:
             except (ValueError, KeyError) as e:
                 print(f"  Error: {e}")
 
+        elif cmd == "disconnect" and len(parts) >= 2:
+            _disconnect_player(srv, parts[1])
+
         elif cmd == "move" and len(parts) >= 4:
             srv["movement"].enqueue(
                 MoveIntent(parts[1], float(parts[2]), float(parts[3]))
             )
-            srv["game_loop"].tick_once(dt)
 
         elif cmd == "attack" and len(parts) >= 3:
             srv["combat"].enqueue(AttackIntent(parts[1], parts[2]))
-            srv["game_loop"].tick_once(dt)
-
-        elif cmd == "tick":
-            srv["game_loop"].tick_once(dt)
-            print(f"  Tick #{srv['game_loop'].tick_count}")
 
         elif cmd == "status" and len(parts) >= 2:
             eid = parts[1]
@@ -248,9 +332,10 @@ def run() -> None:
                 print(f"  {entity}")
                 print(f"  Position: {pos}")
                 print(f"  Zone: {zone_id or 'OUTSIDE'}")
-                print(f"  Health: {entity.health.current}/{entity.health.maximum}")
+                print(f"  HP: {entity.health.current}/{entity.health.maximum}")
+                print(f"  Alive: {entity.is_alive}")
             else:
-                print(f"  Entity '{eid}' not found.")
+                print(f"  Entity '{eid}' not found (dead or despawned).")
 
         elif cmd == "nearby" and len(parts) >= 2:
             ids = srv["world"].get_nearby_entity_ids(parts[1])
@@ -258,15 +343,37 @@ def run() -> None:
                 for nid in sorted(ids):
                     e = srv["world"].get_entity(nid)
                     p = srv["world"].get_entity_position(nid)
-                    print(f"  {nid}: {p}  hp={e.health.current if e else '?'}")
+                    hp = e.health.current if e else "?"
+                    print(f"  {nid}: pos={p}  hp={hp}")
             else:
                 print("  No nearby entities (outside zone or alone).")
 
+        elif cmd == "mobs":
+            for zid, ctrl in srv["controllers"].items():
+                print(f"  Zone '{zid}' (ticks={ctrl.tick_count}):")
+                for mid, mob in list(ctrl._mobs.items()):
+                    pos = srv["world"].get_entity_position(mid)
+                    state = mob.brain.state.value
+                    target = mob.brain.target_id or "-"
+                    hp = f"{mob.entity.health.current}/{mob.entity.health.maximum}"
+                    pos_str = f"({pos[0]:.1f}, {pos[1]:.1f})" if pos else "(?)"
+                    print(f"    {mob.display_name:16s} {pos_str:16s} "
+                          f"hp={hp:8s} state={state:16s} target={target}")
+                if not ctrl._mobs:
+                    print("    (all mobs dead, awaiting respawn)")
+
         elif cmd == "zones":
-            for z in srv["world"].get_all_zones():
+            for zid, ctrl in srv["controllers"].items():
+                z = ctrl.zone
                 b = z.bounds
-                print(f"  {z.zone_id}: '{z.name}' "
-                      f"[{b.min_x},{b.min_y} -> {b.max_x},{b.max_y}]")
+                print(f"  {zid}: '{z.name}' "
+                      f"[{b.min_x},{b.min_y} -> {b.max_x},{b.max_y}] "
+                      f"ticks={ctrl.tick_count} mobs={ctrl.mob_count} "
+                      f"{'LIVE' if ctrl.is_running else 'STOPPED'}")
+
+        elif cmd == "watch":
+            duration = float(parts[1]) if len(parts) >= 2 else 5.0
+            _watch_world(srv, duration)
 
         elif cmd == "quit":
             break
@@ -274,8 +381,12 @@ def run() -> None:
         else:
             print("  Unknown command. Type 'help'.")
 
+    print("\nStopping zone controllers...")
+    for ctrl in srv["controllers"].values():
+        ctrl.stop()
+
     srv["db"].close()
-    print("\nServer shut down.")
+    print("Server shut down.")
 
 
 if __name__ == "__main__":

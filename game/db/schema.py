@@ -20,17 +20,24 @@ CREATE TABLE IF NOT EXISTS players (
 
 MOB_TEMPLATES_TABLE = """
 CREATE TABLE IF NOT EXISTS mob_templates (
-    id           TEXT PRIMARY KEY,
-    name         TEXT NOT NULL,
-    class        TEXT NOT NULL,
-    level        INTEGER NOT NULL DEFAULT 1,
-    base_health  INTEGER NOT NULL DEFAULT 100,
-    base_mana    INTEGER NOT NULL DEFAULT 0,
-    spawn_x      REAL NOT NULL,
-    spawn_y      REAL NOT NULL,
-    zone_id      TEXT NOT NULL,
-    respawn_sec  INTEGER NOT NULL DEFAULT 60,
-    stats_json   TEXT NOT NULL DEFAULT '{}',
+    id               TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    class            TEXT NOT NULL,
+    level            INTEGER NOT NULL DEFAULT 1,
+    base_health      INTEGER NOT NULL DEFAULT 100,
+    base_mana        INTEGER NOT NULL DEFAULT 0,
+    spawn_x          REAL NOT NULL,
+    spawn_y          REAL NOT NULL,
+    zone_id          TEXT NOT NULL,
+    respawn_sec      INTEGER NOT NULL DEFAULT 60,
+    aggression_type  TEXT NOT NULL DEFAULT 'passive',
+    aggro_range      REAL NOT NULL DEFAULT 80.0,
+    attack_range     REAL NOT NULL DEFAULT 5.0,
+    leash_range      REAL NOT NULL DEFAULT 200.0,
+    patrol_radius    REAL NOT NULL DEFAULT 30.0,
+    move_speed       REAL NOT NULL DEFAULT 40.0,
+    attack_cooldown  REAL NOT NULL DEFAULT 2.0,
+    stats_json       TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (zone_id) REFERENCES zones(id)
 );
 """

@@ -27,6 +27,7 @@ class WSMessageType(Enum):
     C_CREATE_CHARACTER = "c_create_character"
     C_MOVE = "c_move"
     C_ATTACK = "c_attack"
+    C_INTERACT = "c_interact"
     C_DISCONNECT = "c_disconnect"
 
     # Server -> Client
@@ -39,6 +40,7 @@ class WSMessageType(Enum):
     S_ENTITY_DIED = "s_entity_died"
     S_ENTITY_SPAWNED = "s_entity_spawned"
     S_PLAYER_DAMAGED = "s_player_damaged"
+    S_INTERACT_RESULT = "s_interact_result"
     S_ERROR = "s_error"
 
 

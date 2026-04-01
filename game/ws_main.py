@@ -3,8 +3,8 @@
 Entry point for the WebSocket game server.
 
 Boots the same game infrastructure as ``game.main`` (database,
-zones, mob templates, zone controllers) but exposes it over
-WebSockets instead of a terminal interface.
+zones, mob templates, map objects, zone controllers) but exposes
+it over WebSockets instead of a terminal interface.
 
 Usage::
 
@@ -21,14 +21,17 @@ import sys
 
 from game.core.event_bus import EventBus
 from game.db.database import Database
+from game.db.repositories.map_object_repo import MapObjectRepository
 from game.db.repositories.mob_template_repo import MobTemplateRepository
 from game.db.repositories.zone_repo import ZoneRepository
 from game.network.connection_manager import ConnectionManager
 from game.network.ws_bridge import WSBridge
 from game.network.ws_server import WSServer
 from game.systems.combat_system import CombatSystem
+from game.systems.interaction_system import InteractionSystem
 from game.systems.movement_system import MovementSystem
 from game.systems.sync_system import SyncSystem
+from game.world.map_object_factory import MapObjectFactory
 from game.world.mob_instance import MobInstance
 from game.world.world import World
 from game.world.zone import Zone, ZoneBounds
@@ -102,6 +105,82 @@ def _seed_mobs(repo: MobTemplateRepository) -> None:
         repo.save(t)
 
 
+def _seed_map_objects(repo: MapObjectRepository) -> None:
+    """Insert starter map objects for Elwynn Forest."""
+    if repo.load_by_zone("elwynn_forest"):
+        return
+    objects = [
+        {
+            "id": "chest_01",
+            "name": "Weathered Chest",
+            "object_type": "interactable",
+            "interaction": "activate",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 200.0, "spawn_y": 180.0,
+            "interact_range": 8.0,
+            "respawn_sec": 120.0,
+            "metadata": {"loot_table": "common_chest"},
+        },
+        {
+            "id": "herb_01",
+            "name": "Peacebloom",
+            "object_type": "resource_node",
+            "interaction": "gather",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 100.0, "spawn_y": 250.0,
+            "interact_range": 6.0,
+            "respawn_sec": 60.0,
+            "metadata": {"skill_required": "Herbalism", "skill_level": 1},
+        },
+        {
+            "id": "herb_02",
+            "name": "Silverleaf",
+            "object_type": "resource_node",
+            "interaction": "gather",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 420.0, "spawn_y": 380.0,
+            "interact_range": 6.0,
+            "respawn_sec": 60.0,
+            "metadata": {"skill_required": "Herbalism", "skill_level": 1},
+        },
+        {
+            "id": "ore_01",
+            "name": "Copper Vein",
+            "object_type": "resource_node",
+            "interaction": "gather",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 380.0, "spawn_y": 120.0,
+            "interact_range": 6.0,
+            "respawn_sec": 90.0,
+            "metadata": {"skill_required": "Mining", "skill_level": 1},
+        },
+        {
+            "id": "npc_marshal",
+            "name": "Marshal McBride",
+            "object_type": "npc",
+            "interaction": "talk",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 250.0, "spawn_y": 250.0,
+            "interact_range": 10.0,
+            "respawn_sec": 0.0,
+            "metadata": {"role": "quest_giver", "title": "Human Starting Zone"},
+        },
+        {
+            "id": "item_sword",
+            "name": "Rusty Shortsword",
+            "object_type": "item",
+            "interaction": "loot",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 310.0, "spawn_y": 160.0,
+            "interact_range": 5.0,
+            "respawn_sec": 180.0,
+            "metadata": {"item_quality": "common", "damage": 5},
+        },
+    ]
+    for o in objects:
+        repo.save(o)
+
+
 # ── server bootstrap ───────────────────────────────────────────────
 
 def build_server() -> dict:
@@ -115,9 +194,11 @@ def build_server() -> dict:
 
     zone_repo = ZoneRepository(db)
     mob_repo = MobTemplateRepository(db)
+    map_obj_repo = MapObjectRepository(db)
 
     _seed_zones(zone_repo)
     _seed_mobs(mob_repo)
+    _seed_map_objects(map_obj_repo)
 
     event_bus = EventBus()
     world = World()
@@ -126,6 +207,7 @@ def build_server() -> dict:
     movement = MovementSystem(world, event_bus)
     combat = CombatSystem(world, event_bus, base_damage=15)
     sync = SyncSystem(world, event_bus, connections)
+    interaction = InteractionSystem(world)
 
     controllers: dict[str, ZoneController] = {}
 
@@ -151,6 +233,10 @@ def build_server() -> dict:
             mob = MobInstance.from_template(t)
             controller.register_mob(mob)
 
+        for t in map_obj_repo.load_by_zone(zone.zone_id):
+            obj = MapObjectFactory.from_template(t)
+            controller.register_map_object(obj)
+
         controllers[zone.zone_id] = controller
 
     return {
@@ -160,6 +246,7 @@ def build_server() -> dict:
         "connections": connections,
         "movement": movement,
         "combat": combat,
+        "interaction": interaction,
         "controllers": controllers,
     }
 
@@ -174,7 +261,8 @@ def run(host: str = "0.0.0.0", port: int = 8765) -> None:
     for zid, ctrl in srv["controllers"].items():
         ctrl.start()
         logger.info(
-            "Zone '%s' controller started (%d mobs)", zid, ctrl.mob_count
+            "Zone '%s' controller started (%d mobs, %d map objects)",
+            zid, ctrl.mob_count, ctrl.map_objects.count,
         )
 
     bridge = WSBridge(
@@ -183,6 +271,7 @@ def run(host: str = "0.0.0.0", port: int = 8765) -> None:
         connections=srv["connections"],
         movement=srv["movement"],
         combat=srv["combat"],
+        interaction=srv["interaction"],
         controllers=srv["controllers"],
     )
 

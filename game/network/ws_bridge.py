@@ -5,7 +5,7 @@ WebSocket bridge between async WebSocket clients and the game engine.
 Subscribes to the shared ``EventBus`` to receive game events,
 translates them into WebSocket messages, and delivers them to
 connected clients.  Incoming client messages are translated
-into game-engine intents (movement, combat).
+into game-engine intents (movement, combat, map-object interaction).
 
 This module is entirely self-contained.  Removing it has zero
 impact on the rest of the game server.
@@ -41,6 +41,7 @@ from game.network.connection import Connection
 from game.network.connection_manager import ConnectionManager
 from game.network.ws_protocol import WSMessageType, encode_message
 from game.systems.combat_system import AttackIntent, CombatSystem
+from game.systems.interaction_system import InteractionSystem
 from game.systems.movement_system import MoveIntent, MovementSystem
 from game.world.world import World
 from game.world.zone_controller import ZoneController
@@ -77,8 +78,8 @@ class WSBridge:
 
     Holds references to shared game systems but does not own them.
     The bridge subscribes to the ``EventBus`` for outbound events
-    and feeds intents into the movement and combat systems for
-    inbound actions.
+    and feeds intents into the movement, combat, and interaction
+    systems for inbound actions.
 
     When a character is created, a ``Connection`` is registered in the
     shared ``ConnectionManager`` so that the ``ZoneController`` mob AI
@@ -96,6 +97,8 @@ class WSBridge:
         Movement system to enqueue move intents.
     combat:
         Combat system to enqueue attack intents.
+    interaction:
+        Interaction system to process map-object interactions.
     controllers:
         Zone controllers keyed by zone id.
     """
@@ -107,6 +110,7 @@ class WSBridge:
         connections: ConnectionManager,
         movement: MovementSystem,
         combat: CombatSystem,
+        interaction: InteractionSystem,
         controllers: dict[str, ZoneController],
     ) -> None:
         self._world = world
@@ -114,6 +118,7 @@ class WSBridge:
         self._conns = connections
         self._movement = movement
         self._combat = combat
+        self._interaction = interaction
         self._controllers = controllers
         self._clients: dict[str, WSClient] = {}
         self._lock = threading.Lock()
@@ -236,7 +241,6 @@ class WSBridge:
         zone_id = self._world.add_entity(character, center_x, center_y)
         client.zone_id = zone_id
 
-        # Register a Connection so ZoneController mob AI detects this player.
         conn = Connection(client.player_id)
         self._conns.add(conn)
 
@@ -280,11 +284,43 @@ class WSBridge:
             return
         self._combat.enqueue(AttackIntent(client.player_id, target_id))
 
+    def handle_interact(self, client: WSClient, object_id: str) -> str:
+        """
+        Process a player's interaction with a map object.
+
+        Validates the player has a character and is in a zone,
+        delegates to the ``InteractionSystem``, and returns the
+        serialised result message.
+        """
+        if client.character is None or client.zone_id is None:
+            return encode_message(WSMessageType.S_INTERACT_RESULT, {
+                "success": False,
+                "reason": "No character or not in a zone.",
+            })
+
+        ctrl = self._controllers.get(client.zone_id)
+        if ctrl is None:
+            return encode_message(WSMessageType.S_INTERACT_RESULT, {
+                "success": False,
+                "reason": "Zone controller not found.",
+            })
+
+        result = self._interaction.interact(
+            player_id=client.player_id,
+            object_id=object_id,
+            registry=ctrl.map_objects,
+        )
+
+        return encode_message(
+            WSMessageType.S_INTERACT_RESULT, result.to_dict()
+        )
+
     # -- world state snapshot ------------------------------------------------
 
     def build_world_state(self, client: WSClient) -> str | None:
         """
-        Build a full snapshot of all entities visible to the client.
+        Build a full snapshot of all entities and map objects visible
+        to the client.
 
         Returns ``None`` if the client has no character or is outside zones.
         """
@@ -330,9 +366,16 @@ class WSBridge:
 
         player_pos = self._world.get_entity_position(client.player_id)
 
+        # Include map objects from the zone's registry.
+        map_objects: list[dict] = []
+        ctrl = self._controllers.get(client.zone_id)
+        if ctrl:
+            map_objects = ctrl.map_objects.snapshot()
+
         return encode_message(WSMessageType.S_WORLD_STATE, {
             "zone_id": client.zone_id,
             "entities": entities,
+            "map_objects": map_objects,
             "player_position": {
                 "x": player_pos[0], "y": player_pos[1],
             } if player_pos else None,

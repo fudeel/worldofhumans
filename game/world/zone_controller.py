@@ -3,8 +3,8 @@
 Autonomous controller for a single gaming zone.
 
 Runs in its own thread and drives the zone's life cycle:
-mob AI evaluation, movement, combat, respawn timers, and
-event broadcasting — all without manual tick commands.
+mob AI evaluation, movement, combat, respawn timers, map-object
+respawns, and event broadcasting — all without manual tick commands.
 
 One ``ZoneController`` per zone. The server holds a dict of
 them and starts each when the server boots.
@@ -31,6 +31,8 @@ from game.network.message_type import MessageType
 from game.systems.combat_system import AttackIntent, CombatSystem
 from game.systems.movement_system import MoveIntent, MovementSystem
 from game.systems.sync_system import SyncSystem
+from game.world.map_object import MapObject
+from game.world.map_object_registry import MapObjectRegistry
 from game.world.mob_instance import MobInstance
 from game.world.world import World
 from game.world.zone import Zone
@@ -55,7 +57,8 @@ class ZoneController:
     1. Evaluate every mob's AI brain → produce move / attack actions.
     2. Feed actions into the movement and combat systems.
     3. Advance respawn timers and re-spawn dead mobs.
-    4. Flush network messages to nearby players.
+    4. Advance map-object respawn timers.
+    5. Flush network messages to nearby players.
 
     Parameters
     ----------
@@ -100,6 +103,7 @@ class ZoneController:
 
         self._mobs: dict[str, MobInstance] = {}
         self._respawn_queue: deque[_RespawnEntry] = deque()
+        self._map_objects = MapObjectRegistry(zone.zone_id)
         self._running = False
         self._thread: threading.Thread | None = None
         self._tick_count = 0
@@ -128,6 +132,11 @@ class ZoneController:
         """Number of live mobs in this zone."""
         return len(self._mobs)
 
+    @property
+    def map_objects(self) -> MapObjectRegistry:
+        """The zone's map-object registry."""
+        return self._map_objects
+
     # -- mob registration ----------------------------------------------------
 
     def register_mob(self, mob: MobInstance) -> None:
@@ -140,6 +149,16 @@ class ZoneController:
         self._world.add_entity(
             mob.entity, mob.spawn_pos.x, mob.spawn_pos.y
         )
+
+    # -- map-object registration ---------------------------------------------
+
+    def register_map_object(self, obj: MapObject) -> None:
+        """
+        Add a map object to this zone's registry.
+
+        The object is immediately visible to players in the zone.
+        """
+        self._map_objects.register(obj)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -162,42 +181,34 @@ class ZoneController:
             self._thread.join(timeout=2.0)
             self._thread = None
 
-    def tick_once(self, dt: float) -> None:
-        """Execute a single tick manually (for testing)."""
-        self._tick(dt)
-
-    # -- main loop -----------------------------------------------------------
+    # -- tick loop -----------------------------------------------------------
 
     def _loop(self) -> None:
         """Fixed-rate tick loop running in a dedicated thread."""
-        prev = time.monotonic()
         while self._running:
-            now = time.monotonic()
-            dt = now - prev
-            prev = now
-
-            self._tick(dt)
-
-            elapsed = time.monotonic() - now
-            sleep = self._tick_interval - elapsed
-            if sleep > 0:
-                time.sleep(sleep)
+            start = time.monotonic()
+            self._tick(self._tick_interval)
+            elapsed = time.monotonic() - start
+            sleep_time = self._tick_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     def _tick(self, dt: float) -> None:
         """
-        One complete server tick for this zone.
+        Execute one server tick.
 
-        Order of operations:
         1. Evaluate mob AI → enqueue intents.
         2. Process movement intents.
         3. Process combat intents.
-        4. Advance respawn timers.
-        5. Flush outbound messages.
+        4. Advance mob respawn timers.
+        5. Advance map-object respawn timers.
+        6. Flush outbound messages.
         """
         self._evaluate_mob_ai(dt)
         self._movement.update(dt)
         self._combat.update(dt)
         self._process_respawns(dt)
+        self._map_objects.update(dt)
         self._sync.update(dt)
         self._tick_count += 1
 
@@ -311,10 +322,3 @@ class ZoneController:
         """Return player ids near the given mob."""
         nearby = self._world.get_nearby_entity_ids(mob_id)
         return [pid for pid in all_player_ids if pid in nearby]
-
-    def __repr__(self) -> str:
-        status = "running" if self._running else "stopped"
-        return (
-            f"ZoneController('{self._zone.zone_id}', "
-            f"mobs={self.mob_count}, ticks={self._tick_count}, {status})"
-        )

@@ -3,11 +3,14 @@
 Processes attack intents and resolves damage.
 
 Combat is zone-gated: a player must be inside a gaming zone
-to deal or receive damage.  All hits are validated server-side.
+to deal or receive damage.  Attacks are also range-gated:
+the attacker must be within ``attack_range`` world units of
+the target.  All hits are validated server-side.
 """
 
 from __future__ import annotations
 
+import math
 from collections import deque
 
 from game.core.event import (
@@ -45,15 +48,28 @@ class CombatSystem:
         Publishes damage and death events.
     base_damage:
         Flat damage dealt per successful attack.
+    attack_range:
+        Maximum distance in world units between attacker and
+        target for a melee hit to connect.
     """
 
     def __init__(
-        self, world: World, event_bus: EventBus, base_damage: int = 10
+        self,
+        world: World,
+        event_bus: EventBus,
+        base_damage: int = 10,
+        attack_range: float = 15.0,
     ) -> None:
         self._world = world
         self._bus = event_bus
         self._base_damage = base_damage
+        self._attack_range = attack_range
         self._queue: deque[AttackIntent] = deque()
+
+    @property
+    def attack_range(self) -> float:
+        """Maximum melee attack distance in world units."""
+        return self._attack_range
 
     def enqueue(self, intent: AttackIntent) -> None:
         """Buffer an attack intent for the next tick."""
@@ -81,6 +97,20 @@ class CombatSystem:
         if not self._world.is_entity_in_zone(intent.target_id):
             return
 
+        # ── Range check ────────────────────────────────────────────
+        attacker_pos = self._world.get_entity_position(intent.attacker_id)
+        target_pos = self._world.get_entity_position(intent.target_id)
+        if attacker_pos is None or target_pos is None:
+            return
+
+        dx = attacker_pos[0] - target_pos[0]
+        dy = attacker_pos[1] - target_pos[1]
+        distance = math.sqrt(dx * dx + dy * dy)
+
+        if distance > self._attack_range:
+            return
+        # ───────────────────────────────────────────────────────────
+
         actual = target.take_damage(self._base_damage)
 
         self._bus.publish(EntityDamagedEvent(
@@ -92,8 +122,7 @@ class CombatSystem:
         ))
 
         if not target.is_alive:
-            pos = self._world.get_entity_position(intent.target_id)
-            px, py = pos if pos else (0.0, 0.0)
+            px, py = target_pos
             self._bus.publish(EntityDiedEvent(
                 event_type=EventType.ENTITY_DIED,
                 entity_id=intent.target_id,

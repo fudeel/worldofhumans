@@ -2,12 +2,14 @@
 """
 Terminal entry point for the game server.
 
-Boots the database, seeds zones and mob templates, then starts
-a ``ZoneController`` per zone in background threads.  The world
-is now alive — mobs patrol, chase, and attack on their own.
+Boots the database, seeds zones, mob templates, and map objects,
+then starts a ``ZoneController`` per zone in background threads.
+The world is now alive — mobs patrol, chase, and attack on their
+own while map objects sit ready for interaction.
 
 The terminal provides commands to connect players, move them
-into zones, and watch the zone react in real time.
+into zones, interact with map objects, and watch the zone react
+in real time.
 """
 
 from __future__ import annotations
@@ -15,8 +17,10 @@ from __future__ import annotations
 import time
 
 from game.characters.character import Character
+from game.components.vector2 import Vector2
 from game.core.event_bus import EventBus
 from game.db.database import Database
+from game.db.repositories.map_object_repo import MapObjectRepository
 from game.db.repositories.mob_template_repo import MobTemplateRepository
 from game.db.repositories.player_repo import PlayerRepository
 from game.db.repositories.zone_repo import ZoneRepository
@@ -29,8 +33,10 @@ from game.network.connection_manager import ConnectionManager
 from game.network.message import Message
 from game.network.message_type import MessageType
 from game.systems.combat_system import AttackIntent, CombatSystem
+from game.systems.interaction_system import InteractionSystem
 from game.systems.movement_system import MoveIntent, MovementSystem
 from game.systems.sync_system import SyncSystem
+from game.world.map_object_factory import MapObjectFactory
 from game.world.mob_instance import MobInstance
 from game.world.world import World
 from game.world.zone import Zone, ZoneBounds
@@ -98,6 +104,82 @@ def _seed_mobs(repo: MobTemplateRepository) -> None:
         repo.save(t)
 
 
+def _seed_map_objects(repo: MapObjectRepository) -> None:
+    """Insert starter map objects for Elwynn Forest."""
+    if repo.load_by_zone("elwynn_forest"):
+        return
+    objects = [
+        {
+            "id": "chest_01",
+            "name": "Weathered Chest",
+            "object_type": "interactable",
+            "interaction": "activate",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 200.0, "spawn_y": 180.0,
+            "interact_range": 8.0,
+            "respawn_sec": 120.0,
+            "metadata": {"loot_table": "common_chest"},
+        },
+        {
+            "id": "herb_01",
+            "name": "Peacebloom",
+            "object_type": "resource_node",
+            "interaction": "gather",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 100.0, "spawn_y": 250.0,
+            "interact_range": 6.0,
+            "respawn_sec": 60.0,
+            "metadata": {"skill_required": "Herbalism", "skill_level": 1},
+        },
+        {
+            "id": "herb_02",
+            "name": "Silverleaf",
+            "object_type": "resource_node",
+            "interaction": "gather",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 420.0, "spawn_y": 380.0,
+            "interact_range": 6.0,
+            "respawn_sec": 60.0,
+            "metadata": {"skill_required": "Herbalism", "skill_level": 1},
+        },
+        {
+            "id": "ore_01",
+            "name": "Copper Vein",
+            "object_type": "resource_node",
+            "interaction": "gather",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 380.0, "spawn_y": 120.0,
+            "interact_range": 6.0,
+            "respawn_sec": 90.0,
+            "metadata": {"skill_required": "Mining", "skill_level": 1},
+        },
+        {
+            "id": "npc_marshal",
+            "name": "Marshal McBride",
+            "object_type": "npc",
+            "interaction": "talk",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 250.0, "spawn_y": 250.0,
+            "interact_range": 10.0,
+            "respawn_sec": 0.0,
+            "metadata": {"role": "quest_giver", "title": "Human Starting Zone"},
+        },
+        {
+            "id": "item_sword",
+            "name": "Rusty Shortsword",
+            "object_type": "item",
+            "interaction": "loot",
+            "zone_id": "elwynn_forest",
+            "spawn_x": 310.0, "spawn_y": 160.0,
+            "interact_range": 5.0,
+            "respawn_sec": 180.0,
+            "metadata": {"item_quality": "common", "damage": 5},
+        },
+    ]
+    for o in objects:
+        repo.save(o)
+
+
 # ── server bootstrap ───────────────────────────────────────────────
 
 def _build_server() -> dict:
@@ -112,9 +194,11 @@ def _build_server() -> dict:
     zone_repo = ZoneRepository(db)
     mob_repo = MobTemplateRepository(db)
     player_repo = PlayerRepository(db)
+    map_obj_repo = MapObjectRepository(db)
 
     _seed_zones(zone_repo)
     _seed_mobs(mob_repo)
+    _seed_map_objects(map_obj_repo)
 
     event_bus = EventBus()
     world = World()
@@ -123,6 +207,7 @@ def _build_server() -> dict:
     movement = MovementSystem(world, event_bus)
     combat = CombatSystem(world, event_bus, base_damage=15)
     sync = SyncSystem(world, event_bus, connections)
+    interaction = InteractionSystem(world)
 
     controllers: dict[str, ZoneController] = {}
 
@@ -146,6 +231,10 @@ def _build_server() -> dict:
             mob = MobInstance.from_template(t)
             controller.register_mob(mob)
 
+        for t in map_obj_repo.load_by_zone(zone.zone_id):
+            obj = MapObjectFactory.from_template(t)
+            controller.register_map_object(obj)
+
         controllers[zone.zone_id] = controller
 
     return {
@@ -155,6 +244,7 @@ def _build_server() -> dict:
         "connections": connections,
         "movement": movement,
         "combat": combat,
+        "interaction": interaction,
         "controllers": controllers,
         "event_bus": event_bus,
     }
@@ -229,9 +319,11 @@ Commands:
   disconnect <id>                              — leave and save
   move <id> <x> <y>                            — move a player
   attack <id> <target>                         — attack a target
+  interact <player_id> <object_id>             — interact with map object
   status <id>                                  — entity info
   nearby <id>                                  — nearby entities
   mobs                                         — all live mobs
+  objects                                      — all map objects
   zones                                        — zone info
   watch [seconds]                              — watch the world live
   quit                                         — shut down
@@ -247,7 +339,8 @@ def _watch_world(srv: dict, duration: float) -> None:
     while time.monotonic() < end:
         print(f"\n--- World snapshot (t={time.monotonic():.1f}) ---")
         for zid, ctrl in srv["controllers"].items():
-            print(f"  Zone '{zid}': ticks={ctrl.tick_count}, mobs={ctrl.mob_count}")
+            print(f"  Zone '{zid}': ticks={ctrl.tick_count}, "
+                  f"mobs={ctrl.mob_count}, objects={ctrl.map_objects.count}")
 
         for zid, ctrl in srv["controllers"].items():
             for mid, mob in list(ctrl._mobs.items()):
@@ -281,7 +374,8 @@ def run() -> None:
 
     for zid, ctrl in srv["controllers"].items():
         ctrl.start()
-        print(f"  Zone '{zid}' controller started ({ctrl.mob_count} mobs)")
+        print(f"  Zone '{zid}' controller started "
+              f"({ctrl.mob_count} mobs, {ctrl.map_objects.count} map objects)")
 
     print("\nWorld is LIVE. Mobs are patrolling.")
     print("Type 'help' for commands.\n")
@@ -323,6 +417,27 @@ def run() -> None:
         elif cmd == "attack" and len(parts) >= 3:
             srv["combat"].enqueue(AttackIntent(parts[1], parts[2]))
 
+        elif cmd == "interact" and len(parts) >= 3:
+            player_id = parts[1]
+            object_id = parts[2]
+            zone_id = srv["world"].get_entity_zone_id(player_id)
+            if not zone_id:
+                print(f"  Player '{player_id}' is not in a zone.")
+                continue
+            ctrl = srv["controllers"].get(zone_id)
+            if not ctrl:
+                print(f"  No controller for zone '{zone_id}'.")
+                continue
+            result = srv["interaction"].interact(
+                player_id, object_id, ctrl.map_objects
+            )
+            if result.success:
+                obj = result.object_data
+                print(f"  [{player_id}] {obj['interaction_type']}d '{obj['name']}' "
+                      f"at ({obj['position']['x']:.0f}, {obj['position']['y']:.0f})")
+            else:
+                print(f"  Failed: {result.reason}")
+
         elif cmd == "status" and len(parts) >= 2:
             eid = parts[1]
             entity = srv["world"].get_entity(eid)
@@ -362,6 +477,18 @@ def run() -> None:
                 if not ctrl._mobs:
                     print("    (all mobs dead, awaiting respawn)")
 
+        elif cmd == "objects":
+            for zid, ctrl in srv["controllers"].items():
+                print(f"  Zone '{zid}':")
+                for obj in ctrl.map_objects.get_all():
+                    state = "active" if obj.active else "inactive"
+                    pos = obj.position
+                    print(f"    {obj.name:20s} ({pos.x:.0f}, {pos.y:.0f}) "
+                          f"{obj.object_type.value:15s} {obj.interaction_type.value:10s} "
+                          f"[{state}]")
+                if ctrl.map_objects.count == 0:
+                    print("    (no map objects)")
+
         elif cmd == "zones":
             for zid, ctrl in srv["controllers"].items():
                 z = ctrl.zone
@@ -369,6 +496,7 @@ def run() -> None:
                 print(f"  {zid}: '{z.name}' "
                       f"[{b.min_x},{b.min_y} -> {b.max_x},{b.max_y}] "
                       f"ticks={ctrl.tick_count} mobs={ctrl.mob_count} "
+                      f"objects={ctrl.map_objects.count} "
                       f"{'LIVE' if ctrl.is_running else 'STOPPED'}")
 
         elif cmd == "watch":

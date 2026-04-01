@@ -5,6 +5,8 @@ from game.enums.aggression_type import AggressionType
 from game.enums.armor_type import ArmorType
 from game.enums.character_class_type import CharacterClassType
 from game.enums.faction import Faction
+from game.enums.interaction_type import InteractionType
+from game.enums.map_object_type import MapObjectType
 from game.enums.mob_state import MobState
 from game.enums.race import Race
 from game.enums.resource_type import ResourceType
@@ -17,6 +19,8 @@ __all__ = [
     "ArmorType",
     "CharacterClassType",
     "Faction",
+    "InteractionType",
+    "MapObjectType",
     "MobState",
     "Race",
     "ResourceType",

@@ -121,6 +121,13 @@ class WSServer:
                 target_id=payload.get("target_id", ""),
             )
 
+        elif msg_type == WSMessageType.C_INTERACT:
+            response = self._bridge.handle_interact(
+                client,
+                object_id=payload.get("object_id", ""),
+            )
+            await client.ws.send(response)
+
         elif msg_type == WSMessageType.C_DISCONNECT:
             self._bridge.unregister_client(client.player_id)
 

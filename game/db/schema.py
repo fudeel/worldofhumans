@@ -64,9 +64,26 @@ CREATE TABLE IF NOT EXISTS loot_tables (
 );
 """
 
+MAP_OBJECTS_TABLE = """
+CREATE TABLE IF NOT EXISTS map_objects (
+    id              TEXT PRIMARY KEY,
+    name            TEXT    NOT NULL,
+    object_type     TEXT    NOT NULL,
+    interaction     TEXT    NOT NULL,
+    zone_id         TEXT    NOT NULL,
+    spawn_x         REAL    NOT NULL,
+    spawn_y         REAL    NOT NULL,
+    interact_range  REAL    NOT NULL DEFAULT 5.0,
+    respawn_sec     REAL    NOT NULL DEFAULT 0.0,
+    metadata_json   TEXT    NOT NULL DEFAULT '{}',
+    FOREIGN KEY (zone_id) REFERENCES zones(id)
+);
+"""
+
 ALL_TABLES = [
     ZONES_TABLE,
     PLAYERS_TABLE,
     MOB_TEMPLATES_TABLE,
     LOOT_TABLES_TABLE,
+    MAP_OBJECTS_TABLE,
 ]

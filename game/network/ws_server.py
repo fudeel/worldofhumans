@@ -4,12 +4,6 @@ Async WebSocket server for the game client frontend.
 
 Accepts WebSocket connections, delegates message handling to the
 ``WSBridge``, and runs a periodic world-state broadcast loop.
-
-This module is a standalone entry point.  It boots the same game
-infrastructure as ``game.main`` but exposes it over WebSockets
-instead of a terminal prompt.  Removing this file and its
-siblings (``ws_protocol.py``, ``ws_bridge.py``) has no effect
-on the rest of the codebase.
 """
 
 from __future__ import annotations
@@ -32,7 +26,6 @@ from game.network.ws_protocol import WSMessageType, decode_message, encode_messa
 
 logger = logging.getLogger(__name__)
 
-# Interval between full world-state broadcasts (seconds).
 _WORLD_STATE_INTERVAL = 0.1
 
 
@@ -68,7 +61,7 @@ class WSServer:
         logger.info("WebSocket server starting on ws://%s:%d", self._host, self._port)
         async with serve(self._handle_client, self._host, self._port) as server:
             logger.info("WebSocket server listening on ws://%s:%d", self._host, self._port)
-            await asyncio.Future()  # run forever
+            await asyncio.Future()
 
     async def _handle_client(self, websocket: ServerConnection) -> None:
         """Handle a single WebSocket client connection."""
@@ -121,11 +114,55 @@ class WSServer:
                 target_id=payload.get("target_id", ""),
             )
 
-        elif msg_type == WSMessageType.C_INTERACT:
-            response = self._bridge.handle_interact(
+        elif msg_type == WSMessageType.C_LOOT_ITEM:
+            response = self._bridge.handle_loot_item(
                 client,
-                object_id=payload.get("object_id", ""),
+                drop_id=payload.get("drop_id", ""),
+                item_id=payload.get("item_id", ""),
             )
+            await client.ws.send(response)
+
+        elif msg_type == WSMessageType.C_LOOT_MONEY:
+            response = self._bridge.handle_loot_money(
+                client,
+                drop_id=payload.get("drop_id", ""),
+            )
+            await client.ws.send(response)
+
+        elif msg_type == WSMessageType.C_INTERACT_NPC:
+            response = self._bridge.handle_interact_npc(
+                client,
+                entity_id=payload.get("entity_id", ""),
+            )
+            await client.ws.send(response)
+
+        elif msg_type == WSMessageType.C_ACCEPT_QUEST:
+            response = self._bridge.handle_accept_quest(
+                client,
+                quest_id=payload.get("quest_id", ""),
+            )
+            await client.ws.send(response)
+
+        elif msg_type == WSMessageType.C_ABANDON_QUEST:
+            response = self._bridge.handle_abandon_quest(
+                client,
+                quest_id=payload.get("quest_id", ""),
+            )
+            await client.ws.send(response)
+
+        elif msg_type == WSMessageType.C_TURN_IN_QUEST:
+            response = self._bridge.handle_turn_in_quest(
+                client,
+                quest_id=payload.get("quest_id", ""),
+            )
+            await client.ws.send(response)
+
+        elif msg_type == WSMessageType.C_GET_INVENTORY:
+            response = self._bridge.handle_get_inventory(client)
+            await client.ws.send(response)
+
+        elif msg_type == WSMessageType.C_GET_QUEST_LOG:
+            response = self._bridge.handle_get_quest_log(client)
             await client.ws.send(response)
 
         elif msg_type == WSMessageType.C_DISCONNECT:

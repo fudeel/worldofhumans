@@ -2,8 +2,9 @@
 """
 Fully-featured game character built on top of ``LivingEntity``.
 
-A ``Character`` adds class identity, race, a stat block, and
-secondary resource pools to the base living-entity contract.
+A ``Character`` adds class identity, race, a stat block,
+secondary resource pools, an inventory, a currency balance,
+and a quest log to the base living-entity contract.
 It is the shared foundation for both player-controlled heroes
 and server-controlled NPCs.
 """
@@ -12,6 +13,9 @@ from __future__ import annotations
 
 from game.characters.living_entity import LivingEntity
 from game.components.class_definition import ClassDefinition
+from game.components.currency import Currency
+from game.components.inventory import Inventory
+from game.components.quest_log import QuestLog
 from game.components.resource_pool import ResourcePool
 from game.components.stat_block import StatBlock
 from game.enums.faction import Faction
@@ -40,6 +44,10 @@ class Character(LivingEntity):
         Maximum health at the given level.
     base_stats:
         Optional starting stat values.
+    inventory_capacity:
+        Number of bag slots the character starts with.
+    starting_copper:
+        Initial copper balance (default 0).
     """
 
     def __init__(
@@ -50,6 +58,8 @@ class Character(LivingEntity):
         level: int = 1,
         base_health: int = 100,
         base_stats: dict | None = None,
+        inventory_capacity: int = 8,
+        starting_copper: int = 0,
     ) -> None:
         if not class_def.supports_race(race):
             raise ValueError(
@@ -64,6 +74,9 @@ class Character(LivingEntity):
         self._resources: dict[ResourceType, ResourcePool] = (
             self._build_resource_pools()
         )
+        self._inventory = Inventory(capacity=inventory_capacity)
+        self._currency = Currency(copper=starting_copper)
+        self._quest_log = QuestLog()
 
     # -- identity ------------------------------------------------------------
 
@@ -104,6 +117,27 @@ class Character(LivingEntity):
     def get_resource(self, rtype: ResourceType) -> ResourcePool | None:
         """Return a specific resource pool, or ``None`` if absent."""
         return self._resources.get(rtype)
+
+    # -- inventory -----------------------------------------------------------
+
+    @property
+    def inventory(self) -> Inventory:
+        """The character's bag / inventory container."""
+        return self._inventory
+
+    # -- currency ------------------------------------------------------------
+
+    @property
+    def currency(self) -> Currency:
+        """The character's money balance."""
+        return self._currency
+
+    # -- quest log -----------------------------------------------------------
+
+    @property
+    def quest_log(self) -> QuestLog:
+        """The character's quest journal."""
+        return self._quest_log
 
     # -- internal helpers ----------------------------------------------------
 

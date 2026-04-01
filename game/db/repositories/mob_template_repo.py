@@ -34,8 +34,9 @@ class MobTemplateRepository:
                  spawn_x, spawn_y, zone_id, respawn_sec,
                  aggression_type, aggro_range, attack_range,
                  leash_range, patrol_radius, move_speed,
-                 attack_cooldown, stats_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 attack_cooldown, drop_money_min, drop_money_max,
+                 is_quest_giver, stats_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data["id"], data["name"], data["class"],
@@ -49,6 +50,9 @@ class MobTemplateRepository:
                 data.get("patrol_radius", 30.0),
                 data.get("move_speed", 40.0),
                 data.get("attack_cooldown", 2.0),
+                data.get("drop_money_min", 0),
+                data.get("drop_money_max", 0),
+                int(data.get("is_quest_giver", False)),
                 stats,
             ),
         )
@@ -63,5 +67,18 @@ class MobTemplateRepository:
         for row in rows:
             d = dict(row)
             d["stats_json"] = json.loads(d["stats_json"])
+            d["is_quest_giver"] = bool(d["is_quest_giver"])
             result.append(d)
         return result
+
+    def load(self, mob_id: str) -> dict | None:
+        """Load a single mob template row by id."""
+        row = self._db.fetchone(
+            "SELECT * FROM mob_templates WHERE id = ?", (mob_id,)
+        )
+        if row is None:
+            return None
+        d = dict(row)
+        d["stats_json"] = json.loads(d["stats_json"])
+        d["is_quest_giver"] = bool(d["is_quest_giver"])
+        return d

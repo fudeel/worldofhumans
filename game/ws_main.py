@@ -2,15 +2,12 @@
 """
 Entry point for the WebSocket game server.
 
-Boots the same game infrastructure as ``game.main`` (database,
-zones, mob templates, map objects, zone controllers) but exposes
-it over WebSockets instead of a terminal interface.
+Boots the game infrastructure (database, zones, mobs, items,
+quests, loot tables) and exposes it over WebSockets.
 
 Usage::
 
     python -m game.ws_main
-
-The server listens on ``ws://0.0.0.0:8765`` by default.
 """
 
 from __future__ import annotations
@@ -21,17 +18,19 @@ import sys
 
 from game.core.event_bus import EventBus
 from game.db.database import Database
-from game.db.repositories.map_object_repo import MapObjectRepository
+from game.db.repositories.item_repo import ItemRepository
+from game.db.repositories.loot_table_repo import LootTableRepository
 from game.db.repositories.mob_template_repo import MobTemplateRepository
+from game.db.repositories.quest_repo import QuestRepository
 from game.db.repositories.zone_repo import ZoneRepository
 from game.network.connection_manager import ConnectionManager
 from game.network.ws_bridge import WSBridge
 from game.network.ws_server import WSServer
 from game.systems.combat_system import CombatSystem
-from game.systems.interaction_system import InteractionSystem
+from game.systems.loot_system import LootSystem
 from game.systems.movement_system import MovementSystem
+from game.systems.quest_system import QuestSystem
 from game.systems.sync_system import SyncSystem
-from game.world.map_object_factory import MapObjectFactory
 from game.world.mob_instance import MobInstance
 from game.world.world import World
 from game.world.zone import Zone, ZoneBounds
@@ -44,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── database seeding (identical to game.main) ──────────────────────
+# ── database seeding ───────────────────────────────────────────────
 
 def _seed_zones(repo: ZoneRepository) -> None:
     """Insert a starter zone if the table is empty."""
@@ -57,6 +56,54 @@ def _seed_zones(repo: ZoneRepository) -> None:
         "min_x": 0.0, "min_y": 0.0,
         "max_x": 500.0, "max_y": 500.0,
     })
+
+
+def _seed_items(repo: ItemRepository) -> None:
+    """Insert starter item definitions."""
+    if repo.load_all():
+        return
+    items = [
+        {
+            "id": "wolf_pelt", "name": "Wolf Pelt",
+            "item_type": "junk", "sell_value": 25,
+            "description": "A rough pelt from a forest wolf. Sells for a few copper.",
+        },
+        {
+            "id": "wolf_fang", "name": "Wolf Fang",
+            "item_type": "junk", "sell_value": 15,
+            "description": "A sharp canine tooth. Troll alchemists covet these.",
+        },
+        {
+            "id": "bandit_bandana", "name": "Red Bandana",
+            "item_type": "armor", "sell_value": 50,
+            "slot": "head",
+            "stat_bonuses": {"Agility": 1},
+            "description": "A crimson bandana once worn by a Defias outlaw.",
+            "level_req": 1,
+        },
+        {
+            "id": "rusty_dagger", "name": "Rusty Dagger",
+            "item_type": "weapon", "sell_value": 75,
+            "slot": "main_hand",
+            "stat_bonuses": {"Strength": 2},
+            "description": "A battered dagger. Still sharp enough to cut.",
+            "level_req": 1,
+        },
+        {
+            "id": "deer_meat", "name": "Deer Meat",
+            "item_type": "consumable", "sell_value": 10,
+            "description": "A cut of venison. Restores health when consumed.",
+            "stackable": True, "max_stack": 10,
+        },
+        {
+            "id": "healing_potion", "name": "Minor Healing Potion",
+            "item_type": "consumable", "sell_value": 30,
+            "description": "Restores a small amount of health.",
+            "stackable": True, "max_stack": 5,
+        },
+    ]
+    for item in items:
+        repo.save(item)
 
 
 def _seed_mobs(repo: MobTemplateRepository) -> None:
@@ -74,6 +121,7 @@ def _seed_mobs(repo: MobTemplateRepository) -> None:
             "aggro_range": 60.0, "attack_range": 5.0,
             "leash_range": 150.0, "patrol_radius": 25.0,
             "move_speed": 45.0, "attack_cooldown": 1.5,
+            "drop_money_min": 2, "drop_money_max": 8,
             "stats_json": {},
         },
         {
@@ -86,6 +134,7 @@ def _seed_mobs(repo: MobTemplateRepository) -> None:
             "aggro_range": 50.0, "attack_range": 5.0,
             "leash_range": 120.0, "patrol_radius": 20.0,
             "move_speed": 35.0, "attack_cooldown": 2.0,
+            "drop_money_min": 5, "drop_money_max": 15,
             "stats_json": {},
         },
         {
@@ -98,6 +147,20 @@ def _seed_mobs(repo: MobTemplateRepository) -> None:
             "aggro_range": 0.0, "attack_range": 5.0,
             "leash_range": 100.0, "patrol_radius": 40.0,
             "move_speed": 50.0, "attack_cooldown": 3.0,
+            "drop_money_min": 0, "drop_money_max": 2,
+            "stats_json": {},
+        },
+        {
+            "id": "marshal_dughan", "name": "Marshal Dughan",
+            "class": "WARRIOR", "level": 10,
+            "base_health": 500, "base_mana": 0,
+            "spawn_x": 245.0, "spawn_y": 255.0,
+            "zone_id": "elwynn_forest", "respawn_sec": 5,
+            "aggression_type": "passive",
+            "aggro_range": 0.0, "attack_range": 5.0,
+            "leash_range": 10.0, "patrol_radius": 3.0,
+            "move_speed": 0.0, "attack_cooldown": 999.0,
+            "is_quest_giver": True,
             "stats_json": {},
         },
     ]
@@ -105,80 +168,69 @@ def _seed_mobs(repo: MobTemplateRepository) -> None:
         repo.save(t)
 
 
-def _seed_map_objects(repo: MapObjectRepository) -> None:
-    """Insert starter map objects for Elwynn Forest."""
-    if repo.load_by_zone("elwynn_forest"):
+def _seed_loot_tables(loot_repo: LootTableRepository) -> None:
+    """Insert starter loot table entries."""
+    if loot_repo.load_by_mob("wolf_01"):
         return
-    objects = [
-        {
-            "id": "chest_01",
-            "name": "Weathered Chest",
-            "object_type": "interactable",
-            "interaction": "activate",
-            "zone_id": "elwynn_forest",
-            "spawn_x": 200.0, "spawn_y": 180.0,
-            "interact_range": 8.0,
-            "respawn_sec": 120.0,
-            "metadata": {"loot_table": "common_chest"},
-        },
-        {
-            "id": "herb_01",
-            "name": "Peacebloom",
-            "object_type": "resource_node",
-            "interaction": "gather",
-            "zone_id": "elwynn_forest",
-            "spawn_x": 100.0, "spawn_y": 250.0,
-            "interact_range": 6.0,
-            "respawn_sec": 60.0,
-            "metadata": {"skill_required": "Herbalism", "skill_level": 1},
-        },
-        {
-            "id": "herb_02",
-            "name": "Silverleaf",
-            "object_type": "resource_node",
-            "interaction": "gather",
-            "zone_id": "elwynn_forest",
-            "spawn_x": 420.0, "spawn_y": 380.0,
-            "interact_range": 6.0,
-            "respawn_sec": 60.0,
-            "metadata": {"skill_required": "Herbalism", "skill_level": 1},
-        },
-        {
-            "id": "ore_01",
-            "name": "Copper Vein",
-            "object_type": "resource_node",
-            "interaction": "gather",
-            "zone_id": "elwynn_forest",
-            "spawn_x": 380.0, "spawn_y": 120.0,
-            "interact_range": 6.0,
-            "respawn_sec": 90.0,
-            "metadata": {"skill_required": "Mining", "skill_level": 1},
-        },
-        {
-            "id": "npc_marshal",
-            "name": "Marshal McBride",
-            "object_type": "npc",
-            "interaction": "talk",
-            "zone_id": "elwynn_forest",
-            "spawn_x": 250.0, "spawn_y": 250.0,
-            "interact_range": 10.0,
-            "respawn_sec": 0.0,
-            "metadata": {"role": "quest_giver", "title": "Human Starting Zone"},
-        },
-        {
-            "id": "item_sword",
-            "name": "Rusty Shortsword",
-            "object_type": "item",
-            "interaction": "loot",
-            "zone_id": "elwynn_forest",
-            "spawn_x": 310.0, "spawn_y": 160.0,
-            "interact_range": 5.0,
-            "respawn_sec": 180.0,
-            "metadata": {"item_quality": "common", "damage": 5},
-        },
-    ]
-    for o in objects:
-        repo.save(o)
+    loot_repo.save("wolf_01", "wolf_pelt", 0.6)
+    loot_repo.save("wolf_01", "wolf_fang", 0.3)
+    loot_repo.save("bandit_01", "bandit_bandana", 0.25)
+    loot_repo.save("bandit_01", "rusty_dagger", 0.15)
+    loot_repo.save("deer_01", "deer_meat", 0.8)
+
+
+def _seed_quests(quest_repo: QuestRepository) -> None:
+    """Insert starter quest definitions."""
+    existing = quest_repo.load_all()
+    if existing:
+        return
+
+    quest_repo.save_quest({
+        "id": "wolves_of_elwynn",
+        "title": "The Wolves of Elwynn",
+        "description": (
+            "Marshal Dughan paces behind his desk, his brow furrowed. "
+            "\"The wolves in this forest have grown bolder. Farmers report "
+            "attacks on their livestock nightly. I need someone to thin "
+            "their numbers. Bring me proof that you've dealt with at least "
+            "three of the beasts, and I'll see you're rewarded.\""
+        ),
+        "giver_entity_id": "marshal_dughan",
+        "level_req": 1,
+        "reward_copper": 50,
+        "reward_xp": 100,
+        "reward_items": ["healing_potion"],
+    })
+    quest_repo.save_objective({
+        "quest_id": "wolves_of_elwynn",
+        "objective_id": "kill_wolves",
+        "description": "Slay Forest Wolves",
+        "target_id": "wolf_01",
+        "required_count": 3,
+    })
+
+    quest_repo.save_quest({
+        "id": "defias_menace",
+        "title": "The Defias Menace",
+        "description": (
+            "\"These Defias thugs are becoming a real problem. They've "
+            "been harassing travelers along the road to Goldshire. "
+            "Put an end to their leader — or at least thin their ranks. "
+            "The people of Elwynn will thank you.\""
+        ),
+        "giver_entity_id": "marshal_dughan",
+        "level_req": 1,
+        "reward_copper": 100,
+        "reward_xp": 200,
+        "reward_items": ["rusty_dagger"],
+    })
+    quest_repo.save_objective({
+        "quest_id": "defias_menace",
+        "objective_id": "kill_bandits",
+        "description": "Defeat Defias Bandits",
+        "target_id": "bandit_01",
+        "required_count": 2,
+    })
 
 
 # ── server bootstrap ───────────────────────────────────────────────
@@ -194,11 +246,15 @@ def build_server() -> dict:
 
     zone_repo = ZoneRepository(db)
     mob_repo = MobTemplateRepository(db)
-    map_obj_repo = MapObjectRepository(db)
+    item_repo = ItemRepository(db)
+    loot_repo = LootTableRepository(db)
+    quest_repo = QuestRepository(db)
 
     _seed_zones(zone_repo)
+    _seed_items(item_repo)
     _seed_mobs(mob_repo)
-    _seed_map_objects(map_obj_repo)
+    _seed_loot_tables(loot_repo)
+    _seed_quests(quest_repo)
 
     event_bus = EventBus()
     world = World()
@@ -207,7 +263,26 @@ def build_server() -> dict:
     movement = MovementSystem(world, event_bus)
     combat = CombatSystem(world, event_bus, base_damage=15)
     sync = SyncSystem(world, event_bus, connections)
-    interaction = InteractionSystem(world)
+
+    # Build item catalogue and loot tables
+    item_catalogue = LootSystem.build_item_catalogue(item_repo.load_all())
+    all_mob_rows = []
+    mob_templates_map: dict[str, dict] = {}
+    for zrow in zone_repo.list_all():
+        rows = mob_repo.load_by_zone(zrow["id"])
+        for r in rows:
+            all_mob_rows.append(r)
+            mob_templates_map[r["id"]] = r
+
+    loot_tables = LootSystem.build_loot_tables(
+        [r["id"] for r in all_mob_rows], loot_repo
+    )
+    loot_system = LootSystem(item_catalogue, loot_tables, mob_templates_map)
+
+    # Build quest system
+    quest_system = QuestSystem.build_from_db_rows(
+        quest_repo.load_all(), item_catalogue
+    )
 
     controllers: dict[str, ZoneController] = {}
 
@@ -233,10 +308,6 @@ def build_server() -> dict:
             mob = MobInstance.from_template(t)
             controller.register_mob(mob)
 
-        for t in map_obj_repo.load_by_zone(zone.zone_id):
-            obj = MapObjectFactory.from_template(t)
-            controller.register_map_object(obj)
-
         controllers[zone.zone_id] = controller
 
     return {
@@ -246,8 +317,9 @@ def build_server() -> dict:
         "connections": connections,
         "movement": movement,
         "combat": combat,
-        "interaction": interaction,
         "controllers": controllers,
+        "loot_system": loot_system,
+        "quest_system": quest_system,
     }
 
 
@@ -261,8 +333,7 @@ def run(host: str = "0.0.0.0", port: int = 8765) -> None:
     for zid, ctrl in srv["controllers"].items():
         ctrl.start()
         logger.info(
-            "Zone '%s' controller started (%d mobs, %d map objects)",
-            zid, ctrl.mob_count, ctrl.map_objects.count,
+            "Zone '%s' controller started (%d mobs)", zid, ctrl.mob_count
         )
 
     bridge = WSBridge(
@@ -271,8 +342,9 @@ def run(host: str = "0.0.0.0", port: int = 8765) -> None:
         connections=srv["connections"],
         movement=srv["movement"],
         combat=srv["combat"],
-        interaction=srv["interaction"],
         controllers=srv["controllers"],
+        loot_system=srv["loot_system"],
+        quest_system=srv["quest_system"],
     )
 
     ws_server = WSServer(bridge, host=host, port=port)

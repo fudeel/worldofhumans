@@ -5,9 +5,10 @@ from game.enums.aggression_type import AggressionType
 from game.enums.armor_type import ArmorType
 from game.enums.character_class_type import CharacterClassType
 from game.enums.faction import Faction
-from game.enums.interaction_type import InteractionType
-from game.enums.map_object_type import MapObjectType
+from game.enums.item_slot import ItemSlot
+from game.enums.item_type import ItemType
 from game.enums.mob_state import MobState
+from game.enums.quest_status import QuestStatus
 from game.enums.race import Race
 from game.enums.resource_type import ResourceType
 from game.enums.role import Role
@@ -19,9 +20,10 @@ __all__ = [
     "ArmorType",
     "CharacterClassType",
     "Faction",
-    "InteractionType",
-    "MapObjectType",
+    "ItemSlot",
+    "ItemType",
     "MobState",
+    "QuestStatus",
     "Race",
     "ResourceType",
     "Role",

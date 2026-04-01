@@ -10,6 +10,9 @@ class LootTableRepository:
     """
     Read and write loot-drop rows in the ``loot_tables`` table.
 
+    Each row links a mob template to an item definition with a
+    probability and quantity range.
+
     Parameters
     ----------
     db:
@@ -19,14 +22,24 @@ class LootTableRepository:
     def __init__(self, db: Database) -> None:
         self._db = db
 
-    def save(self, mob_template_id: str, item_name: str, drop_chance: float) -> None:
+    def save(
+        self,
+        mob_template_id: str,
+        item_id: str,
+        drop_chance: float,
+        min_quantity: int = 1,
+        max_quantity: int = 1,
+    ) -> None:
         """Insert a single loot entry for a mob template."""
         self._db.execute(
             """
-            INSERT INTO loot_tables (mob_template_id, item_name, drop_chance)
-            VALUES (?, ?, ?)
+            INSERT INTO loot_tables
+                (mob_template_id, item_id, drop_chance,
+                 min_quantity, max_quantity)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (mob_template_id, item_name, drop_chance),
+            (mob_template_id, item_id, drop_chance,
+             min_quantity, max_quantity),
         )
         self._db.commit()
 

@@ -25,6 +25,9 @@ class EventType(Enum):
     PLAYER_ENTERED_ZONE = "player_entered_zone"
     PLAYER_LEFT_ZONE = "player_left_zone"
     PLAYER_OUTSIDE_ZONE = "player_outside_zone"
+    LOOT_DROPPED = "loot_dropped"
+    LOOT_EXPIRED = "loot_expired"
+    QUEST_COMPLETED = "quest_completed"
 
 
 @dataclass(frozen=True)
@@ -115,3 +118,29 @@ class PlayerOutsideZoneEvent(GameEvent):
     """A player tried to interact but is outside all gaming zones."""
 
     pass
+
+
+@dataclass(frozen=True)
+class LootDroppedEvent(GameEvent):
+    """A loot drop appeared in the world after a mob death."""
+
+    drop_id: str = ""
+    mob_id: str = ""
+    position_x: float = 0.0
+    position_y: float = 0.0
+
+
+@dataclass(frozen=True)
+class LootExpiredEvent(GameEvent):
+    """A loot drop was invalidated because the mob respawned."""
+
+    drop_id: str = ""
+    mob_id: str = ""
+
+
+@dataclass(frozen=True)
+class QuestCompletedEvent(GameEvent):
+    """A player completed all objectives of a quest."""
+
+    quest_id: str = ""
+    quest_title: str = ""

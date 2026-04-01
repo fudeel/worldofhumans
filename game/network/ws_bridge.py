@@ -5,10 +5,7 @@ WebSocket bridge between async WebSocket clients and the game engine.
 Subscribes to the shared ``EventBus`` to receive game events,
 translates them into WebSocket messages, and delivers them to
 connected clients.  Incoming client messages are translated
-into game-engine intents (movement, combat, map-object interaction).
-
-This module is entirely self-contained.  Removing it has zero
-impact on the rest of the game server.
+into game-engine intents (movement, combat, loot, quests).
 """
 
 from __future__ import annotations
@@ -17,7 +14,6 @@ import asyncio
 import json
 import logging
 import threading
-import time
 import uuid
 from typing import Any
 
@@ -30,23 +26,30 @@ from game.core.event import (
     EntitySpawnedEvent,
     EventType,
     GameEvent,
-    PlayerEnteredZoneEvent,
+    LootDroppedEvent,
+    LootExpiredEvent,
+    QuestCompletedEvent,
 )
 from game.core.event_bus import EventBus
 from game.definitions import CLASS_REGISTRY, get_class_definition
 from game.enums.character_class_type import CharacterClassType
-from game.enums.faction import Faction
 from game.enums.race import Race
 from game.network.connection import Connection
 from game.network.connection_manager import ConnectionManager
 from game.network.ws_protocol import WSMessageType, encode_message
 from game.systems.combat_system import AttackIntent, CombatSystem
-from game.systems.interaction_system import InteractionSystem
+from game.systems.loot_system import LootSystem
 from game.systems.movement_system import MoveIntent, MovementSystem
+from game.systems.quest_system import QuestSystem
 from game.world.world import World
 from game.world.zone_controller import ZoneController
 
 logger = logging.getLogger(__name__)
+
+# Maximum distance (world units) a player can be from a loot drop to pick it up.
+_LOOT_RANGE = 40.0
+# Maximum distance to interact with an NPC quest giver.
+_NPC_INTERACT_RANGE = 50.0
 
 
 class WSClient:
@@ -76,15 +79,6 @@ class WSBridge:
     """
     Manages all WebSocket clients and bridges them to the game engine.
 
-    Holds references to shared game systems but does not own them.
-    The bridge subscribes to the ``EventBus`` for outbound events
-    and feeds intents into the movement, combat, and interaction
-    systems for inbound actions.
-
-    When a character is created, a ``Connection`` is registered in the
-    shared ``ConnectionManager`` so that the ``ZoneController`` mob AI
-    can detect the player as a valid target.
-
     Parameters
     ----------
     world:
@@ -92,15 +86,17 @@ class WSBridge:
     event_bus:
         Shared event bus for subscribing to game events.
     connections:
-        Shared connection manager — mob AI uses this to identify players.
+        Shared connection manager.
     movement:
         Movement system to enqueue move intents.
     combat:
         Combat system to enqueue attack intents.
-    interaction:
-        Interaction system to process map-object interactions.
     controllers:
         Zone controllers keyed by zone id.
+    loot_system:
+        Loot drop manager.
+    quest_system:
+        Quest catalogue and interaction handler.
     """
 
     def __init__(
@@ -110,16 +106,18 @@ class WSBridge:
         connections: ConnectionManager,
         movement: MovementSystem,
         combat: CombatSystem,
-        interaction: InteractionSystem,
         controllers: dict[str, ZoneController],
+        loot_system: LootSystem,
+        quest_system: QuestSystem,
     ) -> None:
         self._world = world
         self._bus = event_bus
         self._conns = connections
         self._movement = movement
         self._combat = combat
-        self._interaction = interaction
         self._controllers = controllers
+        self._loot = loot_system
+        self._quests = quest_system
         self._clients: dict[str, WSClient] = {}
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -148,14 +146,10 @@ class WSBridge:
             self._world.remove_entity(player_id)
             self._conns.remove(player_id)
 
-    # -- inbound message handling --------------------------------------------
+    # -- class data ----------------------------------------------------------
 
     def get_class_data(self) -> str:
-        """
-        Build and return the full class/race/faction data payload.
-
-        Used during character creation to populate the UI.
-        """
+        """Build and return the full class/race/faction data payload."""
         factions: dict[str, list[dict]] = {"Alliance": [], "Horde": []}
 
         for race in Race:
@@ -194,17 +188,12 @@ class WSBridge:
             "zones": zones,
         })
 
+    # -- character creation --------------------------------------------------
+
     def create_character(
         self, client: WSClient, name: str, race_str: str, class_str: str
     ) -> str:
-        """
-        Create a character for the client and place it in the world.
-
-        Also registers a ``Connection`` in the shared ``ConnectionManager``
-        so that mob AI can detect this player as a valid target.
-
-        Returns the serialised response message.
-        """
+        """Create a character for the client and place it in the world."""
         try:
             race = Race(race_str)
             class_type = CharacterClassType(class_str)
@@ -270,7 +259,12 @@ class WSBridge:
                 "min_x": b.min_x, "min_y": b.min_y,
                 "max_x": b.max_x, "max_y": b.max_y,
             },
+            "inventory": character.inventory.to_dict(),
+            "currency": character.currency.to_dict(),
+            "quest_log": character.quest_log.to_dict(),
         })
+
+    # -- movement & combat ---------------------------------------------------
 
     def handle_move(self, client: WSClient, x: float, y: float) -> None:
         """Enqueue a movement intent for the client's character."""
@@ -284,46 +278,199 @@ class WSBridge:
             return
         self._combat.enqueue(AttackIntent(client.player_id, target_id))
 
-    def handle_interact(self, client: WSClient, object_id: str) -> str:
-        """
-        Process a player's interaction with a map object.
+    # -- loot handlers -------------------------------------------------------
 
-        Validates the player has a character and is in a zone,
-        delegates to the ``InteractionSystem``, and returns the
-        serialised result message.
+    def handle_loot_item(self, client: WSClient, drop_id: str, item_id: str) -> str:
         """
-        if client.character is None or client.zone_id is None:
-            return encode_message(WSMessageType.S_INTERACT_RESULT, {
-                "success": False,
-                "reason": "No character or not in a zone.",
+        Player picks up a specific item from a loot drop.
+
+        Validates range, drop existence, and inventory space.
+        """
+        if client.character is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "No character."})
+
+        drop = self._loot.get_drop(drop_id)
+        if drop is None or not drop.is_active:
+            return encode_message(WSMessageType.S_LOOT_RESULT, {
+                "success": False, "reason": "Loot is no longer available.",
             })
 
-        ctrl = self._controllers.get(client.zone_id)
-        if ctrl is None:
-            return encode_message(WSMessageType.S_INTERACT_RESULT, {
-                "success": False,
-                "reason": "Zone controller not found.",
+        player_pos = self._world.get_entity_position(client.player_id)
+        if player_pos is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "Position unknown."})
+
+        dx = player_pos[0] - drop.position[0]
+        dy = player_pos[1] - drop.position[1]
+        if (dx * dx + dy * dy) > _LOOT_RANGE * _LOOT_RANGE:
+            return encode_message(WSMessageType.S_LOOT_RESULT, {
+                "success": False, "reason": "Too far away to loot.",
             })
 
-        result = self._interaction.interact(
-            player_id=client.player_id,
-            object_id=object_id,
-            registry=ctrl.map_objects,
-        )
+        if client.character.inventory.is_full:
+            return encode_message(WSMessageType.S_LOOT_RESULT, {
+                "success": False, "reason": "Inventory is full.",
+            })
 
-        return encode_message(
-            WSMessageType.S_INTERACT_RESULT, result.to_dict()
-        )
+        item = drop.take_item(item_id)
+        if item is None:
+            return encode_message(WSMessageType.S_LOOT_RESULT, {
+                "success": False, "reason": "Item not found in loot.",
+            })
+
+        leftover = client.character.inventory.add_item(item)
+        if leftover > 0:
+            return encode_message(WSMessageType.S_LOOT_RESULT, {
+                "success": False, "reason": "Not enough bag space.",
+            })
+
+        self._loot.remove_empty_drops()
+
+        return encode_message(WSMessageType.S_LOOT_RESULT, {
+            "success": True,
+            "item": item.to_dict(),
+            "inventory": client.character.inventory.to_dict(),
+            "currency": client.character.currency.to_dict(),
+            "drop": drop.to_dict() if drop.is_active and not drop.is_empty else None,
+        })
+
+    def handle_loot_money(self, client: WSClient, drop_id: str) -> str:
+        """Player picks up money from a loot drop."""
+        if client.character is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "No character."})
+
+        drop = self._loot.get_drop(drop_id)
+        if drop is None or not drop.is_active:
+            return encode_message(WSMessageType.S_LOOT_RESULT, {
+                "success": False, "reason": "Loot is no longer available.",
+            })
+
+        player_pos = self._world.get_entity_position(client.player_id)
+        if player_pos is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "Position unknown."})
+
+        dx = player_pos[0] - drop.position[0]
+        dy = player_pos[1] - drop.position[1]
+        if (dx * dx + dy * dy) > _LOOT_RANGE * _LOOT_RANGE:
+            return encode_message(WSMessageType.S_LOOT_RESULT, {
+                "success": False, "reason": "Too far away to loot.",
+            })
+
+        money = drop.take_money()
+        if money > 0:
+            client.character.currency.add(money)
+
+        self._loot.remove_empty_drops()
+
+        return encode_message(WSMessageType.S_LOOT_RESULT, {
+            "success": True,
+            "money_looted": money,
+            "inventory": client.character.inventory.to_dict(),
+            "currency": client.character.currency.to_dict(),
+            "drop": drop.to_dict() if drop.is_active and not drop.is_empty else None,
+        })
+
+    # -- NPC / quest handlers ------------------------------------------------
+
+    def handle_interact_npc(self, client: WSClient, entity_id: str) -> str:
+        """
+        Player interacts with an NPC (quest giver).
+
+        Returns the NPC's available quests if in range.
+        """
+        if client.character is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "No character."})
+
+        player_pos = self._world.get_entity_position(client.player_id)
+        npc_pos = self._world.get_entity_position(entity_id)
+        if player_pos is None or npc_pos is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "Position unknown."})
+
+        dx = player_pos[0] - npc_pos[0]
+        dy = player_pos[1] - npc_pos[1]
+        if (dx * dx + dy * dy) > _NPC_INTERACT_RANGE * _NPC_INTERACT_RANGE:
+            return encode_message(WSMessageType.S_NPC_INTERACTION, {
+                "success": False, "reason": "Too far away to talk.",
+            })
+
+        available = self._quests.get_available_quests_for(entity_id, client.character)
+        return encode_message(WSMessageType.S_QUEST_OFFERED, {
+            "npc_id": entity_id,
+            "quests": [q.to_dict() for q in available],
+        })
+
+    def handle_accept_quest(self, client: WSClient, quest_id: str) -> str:
+        """Player accepts a quest."""
+        if client.character is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "No character."})
+
+        entry = self._quests.accept_quest(client.character, quest_id)
+        if entry is None:
+            return encode_message(WSMessageType.S_ERROR, {
+                "message": "Cannot accept quest (log full, already tracking, or level too low).",
+            })
+
+        return encode_message(WSMessageType.S_QUEST_ACCEPTED, {
+            "quest": entry.to_dict(),
+            "quest_log": client.character.quest_log.to_dict(),
+        })
+
+    def handle_abandon_quest(self, client: WSClient, quest_id: str) -> str:
+        """Player abandons a quest."""
+        if client.character is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "No character."})
+
+        entry = self._quests.abandon_quest(client.character, quest_id)
+        if entry is None:
+            return encode_message(WSMessageType.S_ERROR, {
+                "message": "Quest not found in your log.",
+            })
+
+        return encode_message(WSMessageType.S_QUEST_LOG, {
+            "quest_log": client.character.quest_log.to_dict(),
+        })
+
+    def handle_turn_in_quest(self, client: WSClient, quest_id: str) -> str:
+        """Player turns in a completed quest and receives rewards."""
+        if client.character is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "No character."})
+
+        entry = self._quests.turn_in_quest(client.character, quest_id)
+        if entry is None:
+            return encode_message(WSMessageType.S_ERROR, {
+                "message": "Quest not completed or not found.",
+            })
+
+        return encode_message(WSMessageType.S_QUEST_TURNED_IN, {
+            "quest_id": quest_id,
+            "reward": entry.definition.reward.to_dict(),
+            "quest_log": client.character.quest_log.to_dict(),
+            "inventory": client.character.inventory.to_dict(),
+            "currency": client.character.currency.to_dict(),
+        })
+
+    def handle_get_inventory(self, client: WSClient) -> str:
+        """Return the player's current inventory state."""
+        if client.character is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "No character."})
+
+        return encode_message(WSMessageType.S_INVENTORY_UPDATE, {
+            "inventory": client.character.inventory.to_dict(),
+            "currency": client.character.currency.to_dict(),
+        })
+
+    def handle_get_quest_log(self, client: WSClient) -> str:
+        """Return the player's current quest log."""
+        if client.character is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "No character."})
+
+        return encode_message(WSMessageType.S_QUEST_LOG, {
+            "quest_log": client.character.quest_log.to_dict(),
+        })
 
     # -- world state snapshot ------------------------------------------------
 
     def build_world_state(self, client: WSClient) -> str | None:
-        """
-        Build a full snapshot of all entities and map objects visible
-        to the client.
-
-        Returns ``None`` if the client has no character or is outside zones.
-        """
+        """Build a full snapshot of all entities visible to the client."""
         if client.character is None or client.zone_id is None:
             return None
 
@@ -361,21 +508,22 @@ class WSBridge:
                 entry["mob_name"] = mob.display_name
                 entry["mob_state"] = mob.state.value
                 entry["mob_level"] = mob.entity.level
+                entry["is_quest_giver"] = bool(
+                    mob.template.get("is_quest_giver", False)
+                )
 
             entities.append(entry)
 
         player_pos = self._world.get_entity_position(client.player_id)
 
-        # Include map objects from the zone's registry.
-        map_objects: list[dict] = []
-        ctrl = self._controllers.get(client.zone_id)
-        if ctrl:
-            map_objects = ctrl.map_objects.snapshot()
+        # Include active loot drops visible to this client
+        loot_drops = [d.to_dict() for d in self._loot.get_all_active_drops()]
 
         return encode_message(WSMessageType.S_WORLD_STATE, {
             "zone_id": client.zone_id,
             "entities": entities,
-            "map_objects": map_objects,
+            "map_objects": [],
+            "loot_drops": loot_drops,
             "player_position": {
                 "x": player_pos[0], "y": player_pos[1],
             } if player_pos else None,
@@ -383,9 +531,10 @@ class WSBridge:
                 "current": client.character.health.current,
                 "maximum": client.character.health.maximum,
             } if client.character else None,
+            "currency": client.character.currency.to_dict(),
         })
 
-    # -- event subscribers (outbound to WebSocket clients) -------------------
+    # -- event subscribers ---------------------------------------------------
 
     def _on_entity_damaged(self, event: GameEvent) -> None:
         if not isinstance(event, EntityDamagedEvent):
@@ -401,17 +550,49 @@ class WSBridge:
     def _on_entity_died(self, event: GameEvent) -> None:
         if not isinstance(event, EntityDiedEvent):
             return
+
+        # Generate loot drop for the dead mob
+        drop = self._loot.generate_drop(
+            mob_id=event.entity_id,
+            position_x=event.position_x,
+            position_y=event.position_y,
+        )
+
         msg = encode_message(WSMessageType.S_ENTITY_DIED, {
             "entity_id": event.entity_id,
             "killer_id": event.killer_id,
             "x": event.position_x,
             "y": event.position_y,
+            "loot_drop": drop.to_dict() if drop else None,
         })
         self._broadcast_to_zone_clients(event.entity_id, msg)
+
+        # Advance kill-quest objectives for the killer
+        killer_client = self._clients.get(event.killer_id)
+        if killer_client and killer_client.character:
+            completed = self._quests.on_mob_killed(
+                killer_client.character, event.entity_id
+            )
+            if completed:
+                for entry in completed:
+                    quest_msg = encode_message(WSMessageType.S_QUEST_COMPLETED, {
+                        "quest_id": entry.definition.quest_id,
+                        "quest_title": entry.definition.title,
+                    })
+                    self._send_async(killer_client.ws, quest_msg)
+            # Always send quest log update after a kill
+            update_msg = encode_message(WSMessageType.S_QUEST_UPDATE, {
+                "quest_log": killer_client.character.quest_log.to_dict(),
+            })
+            self._send_async(killer_client.ws, update_msg)
 
     def _on_entity_spawned(self, event: GameEvent) -> None:
         if not isinstance(event, EntitySpawnedEvent):
             return
+
+        # Invalidate any loot drops from this mob
+        self._loot.invalidate_mob_drops(event.entity_id)
+
         msg = encode_message(WSMessageType.S_ENTITY_SPAWNED, {
             "entity_id": event.entity_id,
             "name": event.entity_name,

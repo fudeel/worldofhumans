@@ -5,7 +5,8 @@ WebSocket bridge between async WebSocket clients and the game engine.
 Subscribes to the shared ``EventBus`` to receive game events,
 translates them into WebSocket messages, and delivers them to
 connected clients.  Incoming client messages are translated
-into game-engine intents (movement, combat, loot, quests).
+into game-engine intents (movement, combat, loot, quests,
+and experience).
 """
 
 from __future__ import annotations
@@ -25,7 +26,9 @@ from game.core.event import (
     EntityMovedEvent,
     EntitySpawnedEvent,
     EventType,
+    ExperienceGainedEvent,
     GameEvent,
+    LevelUpEvent,
     LootDroppedEvent,
     LootExpiredEvent,
     QuestCompletedEvent,
@@ -38,6 +41,7 @@ from game.network.connection import Connection
 from game.network.connection_manager import ConnectionManager
 from game.network.ws_protocol import WSMessageType, encode_message
 from game.systems.combat_system import AttackIntent, CombatSystem
+from game.systems.experience_system import ExperienceSystem
 from game.systems.loot_system import LootSystem
 from game.systems.movement_system import MoveIntent, MovementSystem
 from game.systems.quest_system import QuestSystem
@@ -46,10 +50,11 @@ from game.world.zone_controller import ZoneController
 
 logger = logging.getLogger(__name__)
 
-# Maximum distance (world units) a player can be from a loot drop to pick it up.
 _LOOT_RANGE = 40.0
-# Maximum distance to interact with an NPC quest giver.
+"""Maximum distance (world units) a player can be from a loot drop to pick it up."""
+
 _NPC_INTERACT_RANGE = 50.0
+"""Maximum distance to interact with an NPC quest giver."""
 
 
 class WSClient:
@@ -262,6 +267,7 @@ class WSBridge:
             "inventory": character.inventory.to_dict(),
             "currency": character.currency.to_dict(),
             "quest_log": character.quest_log.to_dict(),
+            "experience": character.experience.to_dict(),
         })
 
     # -- movement & combat ---------------------------------------------------
@@ -440,12 +446,35 @@ class WSBridge:
                 "message": "Quest not completed or not found.",
             })
 
+        # Award quest XP
+        exp_result = ExperienceSystem.award_quest_exp(
+            client.character.experience,
+            entry.definition.reward.experience,
+        )
+        if exp_result:
+            exp_msg = encode_message(WSMessageType.S_EXPERIENCE_GAINED, {
+                "source": "quest",
+                "quest_title": entry.definition.title,
+                "exp_gained": exp_result.exp_gained,
+                "experience": exp_result.tracker_snapshot,
+            })
+            self._send_async(client.ws, exp_msg)
+            if exp_result.level_up:
+                lvl_msg = encode_message(WSMessageType.S_LEVEL_UP, {
+                    "old_level": exp_result.level_up.old_level,
+                    "new_level": exp_result.level_up.new_level,
+                    "levels_gained": exp_result.level_up.levels_gained,
+                    "experience": exp_result.tracker_snapshot,
+                })
+                self._send_async(client.ws, lvl_msg)
+
         return encode_message(WSMessageType.S_QUEST_TURNED_IN, {
             "quest_id": quest_id,
             "reward": entry.definition.reward.to_dict(),
             "quest_log": client.character.quest_log.to_dict(),
             "inventory": client.character.inventory.to_dict(),
             "currency": client.character.currency.to_dict(),
+            "experience": client.character.experience.to_dict(),
         })
 
     def handle_get_inventory(self, client: WSClient) -> str:
@@ -516,7 +545,6 @@ class WSBridge:
 
         player_pos = self._world.get_entity_position(client.player_id)
 
-        # Include active loot drops visible to this client
         loot_drops = [d.to_dict() for d in self._loot.get_all_active_drops()]
 
         return encode_message(WSMessageType.S_WORLD_STATE, {
@@ -532,6 +560,7 @@ class WSBridge:
                 "maximum": client.character.health.maximum,
             } if client.character else None,
             "currency": client.character.currency.to_dict(),
+            "experience": client.character.experience.to_dict(),
         })
 
     # -- event subscribers ---------------------------------------------------
@@ -566,6 +595,12 @@ class WSBridge:
             "loot_drop": drop.to_dict() if drop else None,
         })
         self._broadcast_to_zone_clients(event.entity_id, msg)
+
+        # Determine the victim's level for experience calculation
+        victim_level = self._resolve_victim_level(event.entity_id)
+
+        # Award kill XP to the killer (works for both players and mobs)
+        self._award_kill_experience(event.killer_id, victim_level)
 
         # Advance kill-quest objectives for the killer
         killer_client = self._clients.get(event.killer_id)
@@ -611,6 +646,64 @@ class WSBridge:
             "y": event.new_y,
         })
         self._broadcast_to_zone_clients(event.entity_id, msg)
+
+    # -- experience helpers --------------------------------------------------
+
+    def _resolve_victim_level(self, entity_id: str) -> int:
+        """
+        Determine the level of a killed entity.
+
+        Checks mob templates first, then the world entity.
+        """
+        for ctrl in self._controllers.values():
+            if entity_id in ctrl._mobs:
+                return ctrl._mobs[entity_id].entity.level
+        entity = self._world.get_entity(entity_id)
+        if entity is not None:
+            return entity.level
+        # Check if the victim is a player
+        victim_client = self._clients.get(entity_id)
+        if victim_client and victim_client.character:
+            return victim_client.character.level
+        return 1
+
+    def _award_kill_experience(self, killer_id: str, victim_level: int) -> None:
+        """
+        Award kill XP to whoever scored the kill.
+
+        Works for player-kills-mob, mob-kills-player, and
+        player-kills-player scenarios.
+        """
+        # Check if killer is a player
+        killer_client = self._clients.get(killer_id)
+        if killer_client and killer_client.character:
+            tracker = killer_client.character.experience
+            result = ExperienceSystem.award_kill_exp(tracker, victim_level)
+            if result:
+                exp_msg = encode_message(WSMessageType.S_EXPERIENCE_GAINED, {
+                    "source": "kill",
+                    "exp_gained": result.exp_gained,
+                    "experience": result.tracker_snapshot,
+                })
+                self._send_async(killer_client.ws, exp_msg)
+                if result.level_up:
+                    lvl_msg = encode_message(WSMessageType.S_LEVEL_UP, {
+                        "old_level": result.level_up.old_level,
+                        "new_level": result.level_up.new_level,
+                        "levels_gained": result.level_up.levels_gained,
+                        "experience": result.tracker_snapshot,
+                    })
+                    self._send_async(killer_client.ws, lvl_msg)
+            return
+
+        # Killer is a mob — award XP to the mob's entity tracker
+        for ctrl in self._controllers.values():
+            mob = ctrl._mobs.get(killer_id)
+            if mob is not None:
+                ExperienceSystem.award_kill_exp(
+                    mob.entity.experience, victim_level
+                )
+                return
 
     # -- broadcast helpers ---------------------------------------------------
 

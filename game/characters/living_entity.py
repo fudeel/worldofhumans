@@ -4,11 +4,13 @@ Base class for every living thing in the game world.
 
 Both player-controlled and server-controlled characters inherit from
 ``LivingEntity``.  It provides the minimum shared contract: a name,
-a health pool, and the ability to take damage and die.
+a health pool, an experience tracker, and the ability to take damage
+and die.
 """
 
 from __future__ import annotations
 
+from game.components.experience_tracker import ExperienceTracker
 from game.components.resource_pool import ResourcePool
 from game.enums.resource_type import ResourceType
 
@@ -32,6 +34,7 @@ class LivingEntity:
         self._level = level
         self._health = ResourcePool(ResourceType.HEALTH, max_health)
         self._alive = True
+        self._experience = ExperienceTracker(level=level)
 
     # -- identity ------------------------------------------------------------
 
@@ -42,8 +45,8 @@ class LivingEntity:
 
     @property
     def level(self) -> int:
-        """Current level."""
-        return self._level
+        """Current level (delegates to experience tracker)."""
+        return self._experience.level
 
     @level.setter
     def level(self, value: int) -> None:
@@ -60,6 +63,13 @@ class LivingEntity:
     def is_alive(self) -> bool:
         """``True`` while the entity has health remaining."""
         return self._alive
+
+    # -- experience ----------------------------------------------------------
+
+    @property
+    def experience(self) -> ExperienceTracker:
+        """The entity's experience and levelling tracker."""
+        return self._experience
 
     # -- combat interface ----------------------------------------------------
 
@@ -92,15 +102,12 @@ class LivingEntity:
         """
         if self._alive:
             return
+        restore = max(1, int(self._health.maximum * health_pct / 100.0))
+        self._health.restore(restore)
         self._alive = True
-        restore = int(self._health.maximum * (health_pct / 100.0))
-        self._health.restore(max(1, restore))
 
     # -- dunder --------------------------------------------------------------
 
     def __repr__(self) -> str:
         status = "alive" if self._alive else "dead"
-        return (
-            f"LivingEntity('{self._name}', lv{self._level}, "
-            f"{self._health}, {status})"
-        )
+        return f"LivingEntity('{self._name}', lv{self.level}, {status})"

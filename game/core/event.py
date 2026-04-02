@@ -28,6 +28,8 @@ class EventType(Enum):
     LOOT_DROPPED = "loot_dropped"
     LOOT_EXPIRED = "loot_expired"
     QUEST_COMPLETED = "quest_completed"
+    EXPERIENCE_GAINED = "experience_gained"
+    LEVEL_UP = "level_up"
 
 
 @dataclass(frozen=True)
@@ -144,3 +146,23 @@ class QuestCompletedEvent(GameEvent):
 
     quest_id: str = ""
     quest_title: str = ""
+
+
+@dataclass(frozen=True)
+class ExperienceGainedEvent(GameEvent):
+    """A character earned experience points."""
+
+    source: str = ""
+    amount: int = 0
+    current_exp: int = 0
+    exp_to_next_level: int = 0
+    level: int = 1
+
+
+@dataclass(frozen=True)
+class LevelUpEvent(GameEvent):
+    """A character advanced one or more levels."""
+
+    old_level: int = 1
+    new_level: int = 1
+    levels_gained: int = 1

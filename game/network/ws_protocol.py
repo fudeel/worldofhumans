@@ -59,6 +59,8 @@ class WSMessageType(Enum):
     S_QUEST_LOG = "s_quest_log"
     S_INVENTORY_UPDATE = "s_inventory_update"
     S_CURRENCY_UPDATE = "s_currency_update"
+    S_EXPERIENCE_GAINED = "s_experience_gained"
+    S_LEVEL_UP = "s_level_up"
     S_ERROR = "s_error"
 
 

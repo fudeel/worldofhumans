@@ -108,16 +108,16 @@ class WSBridge:
     """
 
     def __init__(
-        self,
-        world: World,
-        event_bus: EventBus,
-        connections: ConnectionManager,
-        movement: MovementSystem,
-        combat: CombatSystem,
-        controllers: dict[str, ZoneController],
-        loot_system: LootSystem,
-        quest_system: QuestSystem,
-        vendor_system: VendorSystem,
+            self,
+            world: World,
+            event_bus: EventBus,
+            connections: ConnectionManager,
+            movement: MovementSystem,
+            combat: CombatSystem,
+            controllers: dict[str, ZoneController],
+            loot_system: LootSystem,
+            quest_system: QuestSystem,
+            vendor_system: VendorSystem,
     ) -> None:
         self._world = world
         self._bus = event_bus
@@ -171,8 +171,8 @@ class WSBridge:
                         "type": ctype.value,
                         "description": cdef.description,
                         "roles": [r.value for r in cdef.roles],
-                        "armor_types": [a.value for a in cdef.allowed_armor],
-                        "weapon_types": [w.value for w in cdef.allowed_weapons],
+                        "armor_types": [a.value for a in cdef.armor_types],
+                        "weapon_types": [w.value for w in cdef.weapon_types],
                         "talent_trees": list(cdef.talent_trees),
                         "resource_types": [r.value for r in cdef.resource_types],
                     })
@@ -201,11 +201,11 @@ class WSBridge:
     # -- character creation --------------------------------------------------
 
     def create_character(
-        self,
-        client: WSClient,
-        name: str,
-        race_str: str,
-        class_str: str,
+            self,
+            client: WSClient,
+            name: str,
+            race_str: str,
+            class_str: str,
     ) -> str:
         """Create a character for the given client."""
         try:

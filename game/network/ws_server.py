@@ -165,6 +165,22 @@ class WSServer:
             response = self._bridge.handle_get_quest_log(client)
             await client.ws.send(response)
 
+        elif msg_type == WSMessageType.C_VENDOR_BUY:
+            response = self._bridge.handle_vendor_buy(
+                client,
+                vendor_id=payload.get("vendor_id", ""),
+                item_id=payload.get("item_id", ""),
+            )
+            await client.ws.send(response)
+
+        elif msg_type == WSMessageType.C_VENDOR_SELL:
+            response = self._bridge.handle_vendor_sell(
+                client,
+                vendor_id=payload.get("vendor_id", ""),
+                slot_index=int(payload.get("slot_index", -1)),
+            )
+            await client.ws.send(response)
+
         elif msg_type == WSMessageType.C_DISCONNECT:
             self._bridge.unregister_client(client.player_id)
 

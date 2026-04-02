@@ -3,7 +3,7 @@
 Entry point for the WebSocket game server.
 
 Boots the game infrastructure (database, zones, mobs, items,
-quests, loot tables) and exposes it over WebSockets.
+quests, loot tables, vendors) and exposes it over WebSockets.
 
 Usage::
 
@@ -22,6 +22,7 @@ from game.db.repositories.item_repo import ItemRepository
 from game.db.repositories.loot_table_repo import LootTableRepository
 from game.db.repositories.mob_template_repo import MobTemplateRepository
 from game.db.repositories.quest_repo import QuestRepository
+from game.db.repositories.vendor_repo import VendorRepository
 from game.db.repositories.zone_repo import ZoneRepository
 from game.network.connection_manager import ConnectionManager
 from game.network.ws_bridge import WSBridge
@@ -31,6 +32,7 @@ from game.systems.loot_system import LootSystem
 from game.systems.movement_system import MovementSystem
 from game.systems.quest_system import QuestSystem
 from game.systems.sync_system import SyncSystem
+from game.systems.vendor_system import VendorSystem
 from game.world.mob_instance import MobInstance
 from game.world.world import World
 from game.world.zone import Zone, ZoneBounds
@@ -92,7 +94,7 @@ def _seed_items(repo: ItemRepository) -> None:
         {
             "id": "deer_meat", "name": "Deer Meat",
             "item_type": "consumable", "sell_value": 10,
-            "description": "A cut of venison. Restores health when consumed.",
+            "description": "Restores health when consumed.",
             "stackable": True, "max_stack": 10,
         },
         {
@@ -100,6 +102,49 @@ def _seed_items(repo: ItemRepository) -> None:
             "item_type": "consumable", "sell_value": 30,
             "description": "Restores a small amount of health.",
             "stackable": True, "max_stack": 5,
+        },
+        # ── Vendor-sold items ──────────────────────────────────────
+        {
+            "id": "bread", "name": "Freshly Baked Bread",
+            "item_type": "consumable", "sell_value": 5,
+            "description": "A warm loaf of bread. Restores a small amount of health.",
+            "stackable": True, "max_stack": 20,
+        },
+        {
+            "id": "water_skin", "name": "Refreshing Water",
+            "item_type": "consumable", "sell_value": 5,
+            "description": "A skin of clean water from Crystal Lake.",
+            "stackable": True, "max_stack": 20,
+        },
+        {
+            "id": "linen_bandage", "name": "Linen Bandage",
+            "item_type": "consumable", "sell_value": 15,
+            "description": "A simple bandage. Slowly restores health.",
+            "stackable": True, "max_stack": 10,
+        },
+        {
+            "id": "short_sword", "name": "Short Sword",
+            "item_type": "weapon", "sell_value": 100,
+            "slot": "main_hand",
+            "stat_bonuses": {"Strength": 3},
+            "description": "A reliable blade forged in Stormwind.",
+            "level_req": 1,
+        },
+        {
+            "id": "apprentice_robe", "name": "Apprentice's Robe",
+            "item_type": "armor", "sell_value": 80,
+            "slot": "chest",
+            "stat_bonuses": {"Intellect": 2},
+            "description": "A plain cloth robe suitable for novice spellcasters.",
+            "level_req": 1,
+        },
+        {
+            "id": "leather_boots", "name": "Sturdy Leather Boots",
+            "item_type": "armor", "sell_value": 60,
+            "slot": "feet",
+            "stat_bonuses": {"Agility": 1, "Stamina": 1},
+            "description": "Well-worn boots that have walked many roads.",
+            "level_req": 1,
         },
     ]
     for item in items:
@@ -161,6 +206,20 @@ def _seed_mobs(repo: MobTemplateRepository) -> None:
             "leash_range": 10.0, "patrol_radius": 3.0,
             "move_speed": 0.0, "attack_cooldown": 999.0,
             "is_quest_giver": True,
+            "stats_json": {},
+        },
+        # ── Vendor NPC ────────────────────────────────────────────
+        {
+            "id": "tomas_vendor", "name": "Tomas the Merchant",
+            "class": "WARRIOR", "level": 10,
+            "base_health": 500, "base_mana": 0,
+            "spawn_x": 260.0, "spawn_y": 230.0,
+            "zone_id": "elwynn_forest", "respawn_sec": 5,
+            "aggression_type": "passive",
+            "aggro_range": 0.0, "attack_range": 5.0,
+            "leash_range": 10.0, "patrol_radius": 3.0,
+            "move_speed": 0.0, "attack_cooldown": 999.0,
+            "is_vendor": True,
             "stats_json": {},
         },
     ]
@@ -233,6 +292,19 @@ def _seed_quests(quest_repo: QuestRepository) -> None:
     })
 
 
+def _seed_vendor_stock(vendor_repo: VendorRepository) -> None:
+    """Insert starter vendor stock entries."""
+    if vendor_repo.load_all():
+        return
+    vendor_repo.save("tomas_vendor", "bread", -1, 10)
+    vendor_repo.save("tomas_vendor", "water_skin", -1, 10)
+    vendor_repo.save("tomas_vendor", "linen_bandage", 10, 50)
+    vendor_repo.save("tomas_vendor", "healing_potion", 5, 100)
+    vendor_repo.save("tomas_vendor", "short_sword", 3, 250)
+    vendor_repo.save("tomas_vendor", "apprentice_robe", 2, 200)
+    vendor_repo.save("tomas_vendor", "leather_boots", 3, 150)
+
+
 # ── server bootstrap ───────────────────────────────────────────────
 
 def build_server() -> dict:
@@ -249,12 +321,14 @@ def build_server() -> dict:
     item_repo = ItemRepository(db)
     loot_repo = LootTableRepository(db)
     quest_repo = QuestRepository(db)
+    vendor_repo = VendorRepository(db)
 
     _seed_zones(zone_repo)
     _seed_items(item_repo)
     _seed_mobs(mob_repo)
     _seed_loot_tables(loot_repo)
     _seed_quests(quest_repo)
+    _seed_vendor_stock(vendor_repo)
 
     event_bus = EventBus()
     world = World()
@@ -283,6 +357,24 @@ def build_server() -> dict:
     quest_system = QuestSystem.build_from_db_rows(
         quest_repo.load_all(), item_catalogue
     )
+
+    # Build vendor system
+    vendor_system = VendorSystem(item_catalogue)
+    for mob_row in all_mob_rows:
+        if mob_row.get("is_vendor", False):
+            vendor_inv = vendor_system.register_vendor(
+                mob_row["id"], starting_copper=5000
+            )
+            stock_rows = vendor_repo.load_by_vendor(mob_row["id"])
+            for sr in stock_rows:
+                item = item_catalogue.get(sr["item_id"])
+                if item:
+                    from game.components.vendor_stock import VendorStockEntry
+                    vendor_inv.add_stock(VendorStockEntry(
+                        item=item,
+                        quantity=sr["quantity"],
+                        buy_price=sr["buy_price"],
+                    ))
 
     controllers: dict[str, ZoneController] = {}
 
@@ -320,6 +412,7 @@ def build_server() -> dict:
         "controllers": controllers,
         "loot_system": loot_system,
         "quest_system": quest_system,
+        "vendor_system": vendor_system,
     }
 
 
@@ -345,6 +438,7 @@ def run(host: str = "0.0.0.0", port: int = 8765) -> None:
         controllers=srv["controllers"],
         loot_system=srv["loot_system"],
         quest_system=srv["quest_system"],
+        vendor_system=srv["vendor_system"],
     )
 
     ws_server = WSServer(bridge, host=host, port=port)

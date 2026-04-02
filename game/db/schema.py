@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS mob_templates (
     drop_money_min   INTEGER NOT NULL DEFAULT 0,
     drop_money_max   INTEGER NOT NULL DEFAULT 0,
     is_quest_giver   INTEGER NOT NULL DEFAULT 0,
+    is_vendor        INTEGER NOT NULL DEFAULT 0,
     stats_json       TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (zone_id) REFERENCES zones(id)
 );
@@ -113,6 +114,18 @@ CREATE TABLE IF NOT EXISTS quest_objectives (
 );
 """
 
+VENDOR_STOCK_TABLE = """
+CREATE TABLE IF NOT EXISTS vendor_stock (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    vendor_id        TEXT NOT NULL,
+    item_id          TEXT NOT NULL,
+    quantity         INTEGER NOT NULL DEFAULT -1,
+    buy_price        INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (vendor_id) REFERENCES mob_templates(id),
+    FOREIGN KEY (item_id) REFERENCES items(id)
+);
+"""
+
 ALL_TABLES = [
     ZONES_TABLE,
     PLAYERS_TABLE,
@@ -121,4 +134,5 @@ ALL_TABLES = [
     LOOT_TABLES_TABLE,
     QUESTS_TABLE,
     QUEST_OBJECTIVES_TABLE,
+    VENDOR_STOCK_TABLE,
 ]

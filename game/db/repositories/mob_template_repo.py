@@ -35,8 +35,8 @@ class MobTemplateRepository:
                  aggression_type, aggro_range, attack_range,
                  leash_range, patrol_radius, move_speed,
                  attack_cooldown, drop_money_min, drop_money_max,
-                 is_quest_giver, stats_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 is_quest_giver, is_vendor, stats_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data["id"], data["name"], data["class"],
@@ -53,6 +53,7 @@ class MobTemplateRepository:
                 data.get("drop_money_min", 0),
                 data.get("drop_money_max", 0),
                 int(data.get("is_quest_giver", False)),
+                int(data.get("is_vendor", False)),
                 stats,
             ),
         )
@@ -68,6 +69,7 @@ class MobTemplateRepository:
             d = dict(row)
             d["stats_json"] = json.loads(d["stats_json"])
             d["is_quest_giver"] = bool(d["is_quest_giver"])
+            d["is_vendor"] = bool(d["is_vendor"])
             result.append(d)
         return result
 
@@ -81,4 +83,5 @@ class MobTemplateRepository:
         d = dict(row)
         d["stats_json"] = json.loads(d["stats_json"])
         d["is_quest_giver"] = bool(d["is_quest_giver"])
+        d["is_vendor"] = bool(d["is_vendor"])
         return d

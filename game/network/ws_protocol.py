@@ -36,6 +36,8 @@ class WSMessageType(Enum):
     C_TURN_IN_QUEST = "c_turn_in_quest"
     C_GET_INVENTORY = "c_get_inventory"
     C_GET_QUEST_LOG = "c_get_quest_log"
+    C_VENDOR_BUY = "c_vendor_buy"
+    C_VENDOR_SELL = "c_vendor_sell"
 
     # Server -> Client
     S_CLASS_DATA = "s_class_data"
@@ -61,6 +63,8 @@ class WSMessageType(Enum):
     S_CURRENCY_UPDATE = "s_currency_update"
     S_EXPERIENCE_GAINED = "s_experience_gained"
     S_LEVEL_UP = "s_level_up"
+    S_VENDOR_OPEN = "s_vendor_open"
+    S_VENDOR_RESULT = "s_vendor_result"
     S_ERROR = "s_error"
 
 

@@ -6,7 +6,7 @@ Subscribes to the shared ``EventBus`` to receive game events,
 translates them into WebSocket messages, and delivers them to
 connected clients.  Incoming client messages are translated
 into game-engine intents (movement, combat, loot, quests,
-and experience).
+vendor interactions, and experience).
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ from game.systems.experience_system import ExperienceSystem
 from game.systems.loot_system import LootSystem
 from game.systems.movement_system import MoveIntent, MovementSystem
 from game.systems.quest_system import QuestSystem
+from game.systems.vendor_system import VendorSystem
 from game.world.world import World
 from game.world.zone_controller import ZoneController
 
@@ -54,7 +55,7 @@ _LOOT_RANGE = 40.0
 """Maximum distance (world units) a player can be from a loot drop to pick it up."""
 
 _NPC_INTERACT_RANGE = 50.0
-"""Maximum distance to interact with an NPC quest giver."""
+"""Maximum distance to interact with an NPC quest giver or vendor."""
 
 
 class WSClient:
@@ -102,6 +103,8 @@ class WSBridge:
         Loot drop manager.
     quest_system:
         Quest catalogue and interaction handler.
+    vendor_system:
+        Vendor inventory and transaction handler.
     """
 
     def __init__(
@@ -114,6 +117,7 @@ class WSBridge:
         controllers: dict[str, ZoneController],
         loot_system: LootSystem,
         quest_system: QuestSystem,
+        vendor_system: VendorSystem,
     ) -> None:
         self._world = world
         self._bus = event_bus
@@ -123,6 +127,7 @@ class WSBridge:
         self._controllers = controllers
         self._loot = loot_system
         self._quests = quest_system
+        self._vendors = vendor_system
         self._clients: dict[str, WSClient] = {}
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -155,36 +160,36 @@ class WSBridge:
 
     def get_class_data(self) -> str:
         """Build and return the full class/race/faction data payload."""
-        factions: dict[str, list[dict]] = {"Alliance": [], "Horde": []}
+        factions: dict[str, list] = {"Alliance": [], "Horde": []}
 
         for race in Race:
-            faction_name = race.faction.value
-            available_classes = []
-            for ctype, cdef in CLASS_REGISTRY.items():
+            race_classes = []
+            for ctype in CharacterClassType:
+                cdef = get_class_definition(ctype)
                 if cdef.supports_race(race):
-                    available_classes.append({
+                    race_classes.append({
                         "type": ctype.value,
                         "description": cdef.description,
                         "roles": [r.value for r in cdef.roles],
-                        "armor_types": [a.value for a in cdef.armor_types],
-                        "weapon_types": [w.value for w in cdef.weapon_types],
+                        "armor_types": [a.value for a in cdef.allowed_armor],
+                        "weapon_types": [w.value for w in cdef.allowed_weapons],
                         "talent_trees": list(cdef.talent_trees),
                         "resource_types": [r.value for r in cdef.resource_types],
                     })
-            factions[faction_name].append({
-                "name": race.value,
-                "classes": available_classes,
-            })
+            if race_classes:
+                factions[race.faction.value].append({
+                    "name": race.value,
+                    "classes": race_classes,
+                })
 
         zones = []
-        for zone in self._world.get_all_zones():
-            b = zone.bounds
+        for z in self._world.get_all_zones():
             zones.append({
-                "zone_id": zone.zone_id,
-                "name": zone.name,
+                "zone_id": z.zone_id,
+                "name": z.name,
                 "bounds": {
-                    "min_x": b.min_x, "min_y": b.min_y,
-                    "max_x": b.max_x, "max_y": b.max_y,
+                    "min_x": z.bounds.min_x, "min_y": z.bounds.min_y,
+                    "max_x": z.bounds.max_x, "max_y": z.bounds.max_y,
                 },
             })
 
@@ -196,9 +201,13 @@ class WSBridge:
     # -- character creation --------------------------------------------------
 
     def create_character(
-        self, client: WSClient, name: str, race_str: str, class_str: str
+        self,
+        client: WSClient,
+        name: str,
+        race_str: str,
+        class_str: str,
     ) -> str:
-        """Create a character for the client and place it in the world."""
+        """Create a character for the given client."""
         try:
             race = Race(race_str)
             class_type = CharacterClassType(class_str)
@@ -379,9 +388,11 @@ class WSBridge:
 
     def handle_interact_npc(self, client: WSClient, entity_id: str) -> str:
         """
-        Player interacts with an NPC (quest giver).
+        Player interacts with an NPC (quest giver or vendor).
 
-        Returns the NPC's available quests if in range.
+        If the NPC is a vendor, returns the vendor inventory.
+        If the NPC is a quest giver, returns available quests.
+        Both roles can coexist on a single NPC.
         """
         if client.character is None:
             return encode_message(WSMessageType.S_ERROR, {"message": "No character."})
@@ -398,11 +409,100 @@ class WSBridge:
                 "success": False, "reason": "Too far away to talk.",
             })
 
+        # Check if NPC is a vendor
+        vendor = self._vendors.get_vendor(entity_id)
+        if vendor is not None:
+            return encode_message(WSMessageType.S_VENDOR_OPEN, {
+                "vendor_id": entity_id,
+                "vendor": vendor.to_dict(),
+                "inventory": client.character.inventory.to_dict(),
+                "currency": client.character.currency.to_dict(),
+            })
+
+        # Otherwise treat as quest giver
         available = self._quests.get_available_quests_for(entity_id, client.character)
         return encode_message(WSMessageType.S_QUEST_OFFERED, {
             "npc_id": entity_id,
             "quests": [q.to_dict() for q in available],
         })
+
+    # -- vendor handlers -----------------------------------------------------
+
+    def handle_vendor_buy(self, client: WSClient, vendor_id: str, item_id: str) -> str:
+        """
+        Player purchases one unit of an item from a vendor.
+
+        Validates range, funds, and bag space before executing.
+        """
+        if client.character is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "No character."})
+
+        player_pos = self._world.get_entity_position(client.player_id)
+        npc_pos = self._world.get_entity_position(vendor_id)
+        if player_pos is None or npc_pos is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "Position unknown."})
+
+        dx = player_pos[0] - npc_pos[0]
+        dy = player_pos[1] - npc_pos[1]
+        if (dx * dx + dy * dy) > _NPC_INTERACT_RANGE * _NPC_INTERACT_RANGE:
+            return encode_message(WSMessageType.S_VENDOR_RESULT, {
+                "success": False, "reason": "Too far away.",
+            })
+
+        result = self._vendors.buy_from_vendor(
+            vendor_id, item_id,
+            client.character.currency,
+            client.character.inventory,
+        )
+
+        vendor = self._vendors.get_vendor(vendor_id)
+        return encode_message(WSMessageType.S_VENDOR_RESULT, {
+            "success": result.success,
+            "reason": result.reason,
+            "action": "buy",
+            "vendor": vendor.to_dict() if vendor else None,
+            "inventory": client.character.inventory.to_dict(),
+            "currency": client.character.currency.to_dict(),
+        })
+
+    def handle_vendor_sell(self, client: WSClient, vendor_id: str, slot_index: int) -> str:
+        """
+        Player sells one unit from an inventory slot to a vendor.
+
+        The vendor pays the item's ``sell_value``.
+        """
+        if client.character is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "No character."})
+
+        player_pos = self._world.get_entity_position(client.player_id)
+        npc_pos = self._world.get_entity_position(vendor_id)
+        if player_pos is None or npc_pos is None:
+            return encode_message(WSMessageType.S_ERROR, {"message": "Position unknown."})
+
+        dx = player_pos[0] - npc_pos[0]
+        dy = player_pos[1] - npc_pos[1]
+        if (dx * dx + dy * dy) > _NPC_INTERACT_RANGE * _NPC_INTERACT_RANGE:
+            return encode_message(WSMessageType.S_VENDOR_RESULT, {
+                "success": False, "reason": "Too far away.",
+            })
+
+        result = self._vendors.sell_to_vendor(
+            vendor_id, slot_index,
+            client.character.currency,
+            client.character.inventory,
+        )
+
+        vendor = self._vendors.get_vendor(vendor_id)
+        return encode_message(WSMessageType.S_VENDOR_RESULT, {
+            "success": result.success,
+            "reason": result.reason,
+            "action": "sell",
+            "vendor": vendor.to_dict() if vendor else None,
+            "inventory": client.character.inventory.to_dict(),
+            "currency": client.character.currency.to_dict(),
+        })
+
+    # -- quest handlers ------------------------------------------------------
 
     def handle_accept_quest(self, client: WSClient, quest_id: str) -> str:
         """Player accepts a quest."""
@@ -540,6 +640,9 @@ class WSBridge:
                 entry["is_quest_giver"] = bool(
                     mob.template.get("is_quest_giver", False)
                 )
+                entry["is_vendor"] = bool(
+                    mob.template.get("is_vendor", False)
+                )
 
             entities.append(entry)
 
@@ -605,29 +708,25 @@ class WSBridge:
         # Advance kill-quest objectives for the killer
         killer_client = self._clients.get(event.killer_id)
         if killer_client and killer_client.character:
-            completed = self._quests.on_mob_killed(
+            updated = self._quests.on_mob_killed(
                 killer_client.character, event.entity_id
             )
-            if completed:
-                for entry in completed:
-                    quest_msg = encode_message(WSMessageType.S_QUEST_COMPLETED, {
-                        "quest_id": entry.definition.quest_id,
-                        "quest_title": entry.definition.title,
-                    })
-                    self._send_async(killer_client.ws, quest_msg)
-            # Always send quest log update after a kill
-            update_msg = encode_message(WSMessageType.S_QUEST_UPDATE, {
-                "quest_log": killer_client.character.quest_log.to_dict(),
-            })
-            self._send_async(killer_client.ws, update_msg)
+            if updated:
+                for qe in updated:
+                    self._send_async(killer_client.ws, encode_message(
+                        WSMessageType.S_QUEST_UPDATE, {"quest": qe.to_dict()}
+                    ))
+                    if qe.is_complete:
+                        self._send_async(killer_client.ws, encode_message(
+                            WSMessageType.S_QUEST_COMPLETED, {
+                                "quest_id": qe.quest_id,
+                                "title": qe.definition.title,
+                            }
+                        ))
 
     def _on_entity_spawned(self, event: GameEvent) -> None:
         if not isinstance(event, EntitySpawnedEvent):
             return
-
-        # Invalidate any loot drops from this mob
-        self._loot.invalidate_mob_drops(event.entity_id)
-
         msg = encode_message(WSMessageType.S_ENTITY_SPAWNED, {
             "entity_id": event.entity_id,
             "name": event.entity_name,
@@ -640,36 +739,22 @@ class WSBridge:
     def _on_entity_moved(self, event: GameEvent) -> None:
         if not isinstance(event, EntityMovedEvent):
             return
-        msg = encode_message(WSMessageType.S_ENTITY_UPDATE, {
-            "entity_id": event.entity_id,
-            "x": event.new_x,
-            "y": event.new_y,
-        })
-        self._broadcast_to_zone_clients(event.entity_id, msg)
 
     # -- experience helpers --------------------------------------------------
 
     def _resolve_victim_level(self, entity_id: str) -> int:
-        """
-        Determine the level of a killed entity.
-
-        Checks mob templates first, then the world entity.
-        """
+        """Look up the level of a recently killed entity."""
         for ctrl in self._controllers.values():
             if entity_id in ctrl._mobs:
                 return ctrl._mobs[entity_id].entity.level
         entity = self._world.get_entity(entity_id)
-        if entity is not None:
+        if entity:
             return entity.level
-        # Check if the victim is a player
-        victim_client = self._clients.get(entity_id)
-        if victim_client and victim_client.character:
-            return victim_client.character.level
         return 1
 
     def _award_kill_experience(self, killer_id: str, victim_level: int) -> None:
         """
-        Award kill XP to whoever scored the kill.
+        Award kill experience to the killer entity.
 
         Works for player-kills-mob, mob-kills-player, and
         player-kills-player scenarios.
